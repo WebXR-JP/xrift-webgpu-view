@@ -10,10 +10,11 @@
  */
 
 import { useFrame } from '@react-three/fiber'
+import type { RootState } from '@react-three/fiber'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { LinearFilter, NearestFilter, SRGBColorSpace, Texture } from 'three'
+import { LinearFilter, NearestFilter, PerspectiveCamera, SRGBColorSpace, Texture } from 'three'
 import GpuWorker from '../worker/gpuWorker.ts?worker'
-import type { FrameRequest, WorkerRequest, WorkerResponse } from '../worker/protocol'
+import type { FrameRequest, ViewMatrices, WorkerRequest, WorkerResponse } from '../worker/protocol'
 
 export interface UseGpuWorkerOptions {
   /** Worker の描画解像度 */
@@ -23,6 +24,12 @@ export interface UseGpuWorkerOptions {
   depth?: boolean
   maxFps?: number
   enabled?: boolean
+  /**
+   * 視点を返す関数。1 要素なら単眼、2 要素ならステレオ（[0]=左目, [1]=右目）。
+   * 省略時はメインカメラ 1 視点。
+   * 呼ばれた時点のメインカメラを読んで、その場で視点を作る用途を想定している。
+   */
+  getViewCameras?: (state: RootState) => PerspectiveCamera[]
 }
 
 export interface UseGpuWorkerResult {
@@ -52,6 +59,7 @@ export function useGpuWorker({
   depth = false,
   maxFps = 60,
   enabled = true,
+  getViewCameras,
 }: UseGpuWorkerOptions): UseGpuWorkerResult {
   const workerRef = useRef<Worker | null>(null)
   const readyRef = useRef(false)
@@ -82,6 +90,9 @@ export function useGpuWorker({
 
   const optionsRef = useRef({ width, height, depth })
   optionsRef.current = { width, height, depth }
+
+  const getViewCamerasRef = useRef(getViewCameras)
+  getViewCamerasRef.current = getViewCameras
 
   // --- Worker 起動 ---------------------------------------------------------
   useEffect(() => {
@@ -192,22 +203,29 @@ export function useGpuWorker({
     if (time - lastSentRef.current < 1 / maxFps) return
     lastSentRef.current = time
 
-    const camera = state.camera
-    camera.updateMatrixWorld()
+    const getViews = getViewCamerasRef.current
+    const viewCameras = getViews ? getViews(state) : [(state.camera as PerspectiveCamera)]
+
+    const views: ViewMatrices[] = viewCameras.map((camera) => {
+      camera.updateMatrixWorld()
+      return {
+        view: Array.from(camera.matrixWorldInverse.elements),
+        projection: Array.from(camera.projectionMatrix.elements),
+        camera: {
+          fov: camera.isPerspectiveCamera ? camera.fov : 50,
+          aspect: camera.isPerspectiveCamera ? camera.aspect : 1,
+          near: camera.near,
+          far: camera.far,
+        },
+      }
+    })
 
     const message: FrameRequest = {
       type: 'frame',
       id: ++frameIdRef.current,
       time,
       delta: Math.min(delta, 0.1),
-      view: Array.from(camera.matrixWorldInverse.elements),
-      projection: Array.from(camera.projectionMatrix.elements),
-      camera: {
-        fov: 'fov' in camera ? (camera as { fov: number }).fov : 50,
-        aspect: 'aspect' in camera ? (camera as { aspect: number }).aspect : 1,
-        near: camera.near,
-        far: camera.far,
-      },
+      views,
     }
 
     inFlightRef.current = true

@@ -13,6 +13,9 @@ import { COLORS, WORLD_CONFIG } from './constants'
  */
 const USE_DEPTH_COMPOSITE = true
 
+/** 左右 2 視点で描く（モニタでは左右に並ぶ） */
+const STEREO = true
+
 export interface WorldProps {
   position?: [number, number, number]
   scale?: number
@@ -89,7 +92,7 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
 
       {/* ========== Worker + WebGPU の描画結果 ========== */}
       {USE_DEPTH_COMPOSITE ? (
-        <DepthComposite />
+        <DepthComposite stereo={STEREO} />
       ) : (
         <WorkerRenderPanel coverage={0.55} anchor="bottom-right" />
       )}

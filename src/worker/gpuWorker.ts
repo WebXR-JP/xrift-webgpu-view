@@ -42,7 +42,7 @@ import {
   uniform,
   vec3,
 } from 'three/tsl'
-import type { FrameRequest, WorkerRequest, WorkerResponse } from './protocol'
+import type { FrameRequest, ViewMatrices, WorkerRequest, WorkerResponse } from './protocol'
 
 /** worker スコープ（tsconfig が DOM lib なので最小限を自前で宣言する） */
 const scope = globalThis as unknown as {
@@ -86,7 +86,18 @@ const DEPTH_RANGE = 50
 // ---------------------------------------------------------------------------
 
 let scene = new Scene()
-let camera = new PerspectiveCamera(50, 1, 0.1, 1000)
+
+/** 視点ごとのカメラ（[0] が単眼 or 左目、[1] が右目） */
+const cameras: PerspectiveCamera[] = []
+
+function getCamera(index: number) {
+  let camera = cameras[index]
+  if (!camera) {
+    camera = new PerspectiveCamera(50, 1, 0.1, 1000)
+    cameras.push(camera)
+  }
+  return camera
+}
 
 let renderer: WebGPURenderer | null = null
 let offscreen: OffscreenCanvas | null = null
@@ -298,12 +309,13 @@ async function initRenderer(width: number, height: number) {
   createScene()
 
   // 初期配置（最初の 'frame' が来るまでの見た目）
-  camera.position.set(0, 1.7, 8)
-  camera.aspect = width / height
-  camera.updateProjectionMatrix()
+  const warmupCamera = getCamera(0)
+  warmupCamera.position.set(0, 1.7, 8)
+  warmupCamera.aspect = width / height
+  warmupCamera.updateProjectionMatrix()
 
   renderer.compute(computeInit!)
-  renderer.render(scene, camera)
+  renderer.render(scene, warmupCamera)
 
   return {
     backend: 'webgpu',
@@ -315,14 +327,15 @@ async function initRenderer(width: number, height: number) {
 // メッセージ処理
 // ---------------------------------------------------------------------------
 
+/** 1 視点ぶんのサイズ。キャンバスは横に viewCount 並べたアトラスになる */
 let size = { width: 0, height: 0 }
+/** 現在の視点数（1 = 単眼 / 2 = ステレオ） */
+let viewCount = 1
 let initialized = false
 let busy = false
 let pending: FrameRequest | null = null
 
-function applyCamera(frame: FrameRequest) {
-  const { view, projection, camera: info } = frame
-
+function applyView(camera: PerspectiveCamera, { view, projection, camera: info }: ViewMatrices) {
   // view からワールド行列を作り、分解して position/quaternion/scale に反映する。
   // （WebGPURenderer は matrix から matrixWorld / matrixWorldInverse を更新するため）
   camera.matrix.fromArray(view).invert()
@@ -336,6 +349,24 @@ function applyCamera(frame: FrameRequest) {
   camera.aspect = info.aspect
   camera.near = info.near
   camera.far = info.far
+}
+
+/**
+ * 視点数が変わったらキャンバス（アトラス）のサイズを合わせる。
+ * size は 1 視点ぶんで、キャンバスは横に count 並べる。
+ */
+function applyViewCount(count: number) {
+  if (!renderer || count === viewCount) return
+  viewCount = count
+  renderer.setSize(size.width * count, size.height, false)
+}
+
+/** アトラス（横並び）の 1 視点分にビューポートとシザーを合わせる */
+function applyViewport(index: number) {
+  if (!renderer) return
+  renderer.setViewport(index * size.width, 0, size.width, size.height)
+  renderer.setScissor(index * size.width, 0, size.width, size.height)
+  renderer.setScissorTest(true)
 }
 
 /** OffscreenCanvas の内容を ImageBitmap にする（WebGPU コンテキストでも動く方を使う） */
@@ -352,7 +383,7 @@ async function snapshot(canvas: OffscreenCanvas) {
  * マテリアルを差し替えて同じシーンを描くだけ（ジオメトリは 1 回増える）。
  * パーティクルは深度を書かないものとして外す。
  */
-async function renderDepthPass() {
+async function renderDepthPass(count: number) {
   if (!renderer || !offscreen || !depthMaterial) return null
 
   const previousBackground = scene.background
@@ -363,7 +394,11 @@ async function renderDepthPass() {
   scene.overrideMaterial = depthMaterial
   if (particles) particles.visible = false
 
-  renderer.render(scene, camera)
+  for (let i = 0; i < count; i++) {
+    applyViewport(i)
+    renderer.render(scene, getCamera(i))
+  }
+
   const bitmap = await snapshot(offscreen)
 
   scene.background = previousBackground
@@ -378,7 +413,13 @@ async function renderFrame(frame: FrameRequest) {
 
   const started = performance.now()
 
-  applyCamera(frame)
+  // ステレオは最大 2 視点。アトラスの横幅を等分して描く
+  const count = Math.min(2, Math.max(1, frame.views.length))
+  applyViewCount(count)
+  for (let i = 0; i < count; i++) {
+    applyView(getCamera(i), frame.views[i])
+  }
+
   uTime.value = frame.time
   uDelta.value = frame.delta
 
@@ -386,10 +427,15 @@ async function renderFrame(frame: FrameRequest) {
 
   let depthBitmap: ImageBitmap | null = null
   if (wantDepth) {
-    depthBitmap = await renderDepthPass()
+    depthBitmap = await renderDepthPass(count)
   }
 
-  renderer.render(scene, camera)
+  for (let i = 0; i < count; i++) {
+    applyViewport(i)
+    renderer.render(scene, getCamera(i))
+  }
+  renderer.setScissorTest(false)
+
   const bitmap = await snapshot(offscreen)
 
   scope.postMessage(
@@ -398,7 +444,7 @@ async function renderFrame(frame: FrameRequest) {
       id: frame.id,
       bitmap,
       depthBitmap: depthBitmap ?? undefined,
-      width: size.width,
+      width: size.width * count,
       height: size.height,
       renderMs: performance.now() - started,
     },
@@ -453,9 +499,7 @@ scope.onmessage = async (event) => {
   if (message.type === 'resize') {
     size = { width: message.width, height: message.height }
     if (!renderer) return
-    renderer.setSize(size.width, size.height, false)
-    camera.aspect = size.width / size.height
-    camera.updateProjectionMatrix()
+    renderer.setSize(size.width * viewCount, size.height, false)
     return
   }
 

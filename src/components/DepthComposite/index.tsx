@@ -12,12 +12,25 @@
  *
  * WebGL2 には gl_FragDepth が無いため、深度を「書く」のではなく
  * 深度を比較して色を選ぶ方式にしている。
+ *
+ * ステレオ（stereo）:
+ *   左右の視点をアトラス（横並び）で Worker に描かせ、メインシーンも
+ *   左右 2 回描いて、画面の左右に並べて出す（モニタでの確認用）。
+ *
+ * XR:
+ *   合成はできない（WebXR のフレームバッファはブラウザが持っており、
+ *   メインシーンを RT に描いて目ごとに合成する経路が無い）。
+ *   代わりに XR 中は「左右の目レイヤーに分けた板ポリ」に Worker の
+ *   左右画像を貼る（three の XR は layer 1 = 左目 / layer 2 = 右目）。
+ *   この経路は実機未検証。
  */
 
 import { useFrame, useThree } from '@react-three/fiber'
-import { useEffect, useMemo } from 'react'
+import type { RootState } from '@react-three/fiber'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import {
   ACESFilmicToneMapping,
+  ArrayCamera,
   DepthTexture,
   HalfFloatType,
   LinearFilter,
@@ -28,12 +41,19 @@ import {
   PlaneGeometry,
   Scene,
   ShaderMaterial,
+  Vector3,
   WebGLRenderTarget,
 } from 'three'
 import { useGpuWorker } from '../../gpu-worker/useGpuWorker'
 
 /** Worker 側の深度パック範囲（worker/gpuWorker.ts の DEPTH_RANGE と合わせる） */
 const DEPTH_RANGE = 50
+/** ステレオ確認用の眼間距離の半分（メートル） */
+const EYE_OFFSET = 0.032
+/** XR で板ポリを置く距離（メートル） */
+const XR_SCREEN_DISTANCE = 2.4
+/** XR の板ポリの横幅（メートル） */
+const XR_SCREEN_WIDTH = 2.4
 
 const vertexShader = /* glsl */ `
 varying vec2 vUv;
@@ -44,25 +64,8 @@ void main() {
 }
 `
 
-const fragmentShader = /* glsl */ `
-precision highp float;
-
-varying vec2 vUv;
-
-uniform sampler2D uSceneColor;
-uniform sampler2D uSceneDepth;
-uniform sampler2D uWorkerColor;
-uniform sampler2D uWorkerDepth;
-
-uniform float uNear;
-uniform float uFar;
-uniform float uDepthRange;
-uniform float uExposure;
-uniform float uWorkerExposure;
-uniform int uToneMapping;
-uniform int uDebug;
-
-// --- three.js の ACESFilmicToneMapping と同じ実装 -------------------------
+/** three.js の ACESFilmicToneMapping と同じ実装（合成側で使う） */
+const TONE_MAPPING_CHUNK = /* glsl */ `
 vec3 RRTAndODTFit(vec3 v) {
   vec3 a = v * (v + 0.0245786) - 0.000090537;
   vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
@@ -93,6 +96,28 @@ vec3 linearToSRGB(vec3 color) {
     vec3(lessThanEqual(color, vec3(0.0031308)))
   );
 }
+`
+
+const fragmentShader = /* glsl */ `
+precision highp float;
+
+varying vec2 vUv;
+
+uniform sampler2D uSceneColor;
+uniform sampler2D uSceneDepth;
+uniform sampler2D uWorkerColor;
+uniform sampler2D uWorkerDepth;
+
+uniform float uNear;
+uniform float uFar;
+uniform float uDepthRange;
+uniform float uExposure;
+uniform float uWorkerExposure;
+uniform float uEyeCount;
+uniform int uToneMapping;
+uniform int uDebug;
+
+${TONE_MAPPING_CHUNK}
 
 // R,G に詰めた 16bit 距離を [0,1] に戻す
 float unpackDepth(vec2 bytes) {
@@ -102,14 +127,30 @@ float unpackDepth(vec2 bytes) {
 }
 
 void main() {
+  // ステレオのときは画面を左右に分け、それぞれの視点の画像を引く
+  float eye = 0.0;
+  vec2 uv = vUv;
+  if (uEyeCount > 1.5) {
+    eye = step(0.5, vUv.x);
+    uv.x = fract(vUv.x * 2.0);
+  }
+
+  vec2 sceneUv = vec2((eye + uv.x) / uEyeCount, vUv.y);
+  // Worker の画像は上下反転で入っているので V を反転して引く
+  vec2 workerUv = vec2((eye + uv.x) / uEyeCount, 1.0 - vUv.y);
+
   // シーンの深度（window z）→ 視点からの距離
-  float depth = texture2D(uSceneDepth, vUv).x;
+  float depth = texture2D(uSceneDepth, sceneUv).x;
   float sceneDist = -(uNear * uFar) / ((uFar - uNear) * depth - uFar);
 
-  // Worker 側の距離。Worker の画像は上下反転で入っているので V を反転して引く
-  vec2 workerUv = vec2(vUv.x, 1.0 - vUv.y);
   float packedDepth = unpackDepth(texture2D(uWorkerDepth, workerUv).rg);
   float workerDist = packedDepth <= 0.0 ? 1e9 : packedDepth * uDepthRange;
+
+  if (uDebug == 5) {
+    // アトラス全体（目の分割なし）を表示
+    gl_FragColor = vec4(texture2D(uWorkerColor, vec2(vUv.x, 1.0 - vUv.y)).rgb, 1.0);
+    return;
+  }
 
   if (uDebug == 4) {
     // どちらを採用したかのマスク（緑 = Worker / 赤 = シーン）
@@ -148,7 +189,7 @@ void main() {
   }
 
   // シーン色はリニアなので、レンダラと同じ変換をここで行う
-  vec3 color = texture2D(uSceneColor, vUv).rgb;
+  vec3 color = texture2D(uSceneColor, sceneUv).rgb;
   if (uToneMapping == 4) {
     color = acesFilmic(color * (uExposure / 0.6));
   } else if (uToneMapping == 1) {
@@ -158,26 +199,73 @@ void main() {
 }
 `
 
+const screenVertexShader = /* glsl */ `
+varying vec2 vUv;
+
+void main() {
+  vUv = uv;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`
+
+/** XR 用: アトラスの片目分を板ポリに貼る */
+const screenFragmentShader = /* glsl */ `
+precision highp float;
+
+varying vec2 vUv;
+
+uniform sampler2D uColor;
+uniform float uEye;
+uniform float uEyeCount;
+uniform float uExposure;
+
+${TONE_MAPPING_CHUNK}
+
+void main() {
+  vec2 uv = vec2((uEye + vUv.x) / uEyeCount, vUv.y);
+  vec3 color = texture2D(uColor, uv).rgb;
+  color = acesFilmic(color * (uExposure / 0.6));
+  gl_FragColor = vec4(linearToSRGB(color), 1.0);
+}
+`
+
+/** 板ポリの UV を上下反転する（ImageBitmap は flipY が効かないため） */
+function createFlippedPlaneGeometry() {
+  const geometry = new PlaneGeometry(1, 1)
+  const uv = geometry.getAttribute('uv')
+  for (let i = 0; i < uv.count; i++) {
+    uv.setY(i, 1 - uv.getY(i))
+  }
+  uv.needsUpdate = true
+  return geometry
+}
+
 export interface DepthCompositeProps {
   enabled?: boolean
+  /** 左右 2 視点で描く（モニタでは左右に並べて表示される） */
+  stereo?: boolean
   /** Worker 側の描画解像度の上限（横幅 px） */
   maxWidth?: number
   /** 解像度スケール（devicePixelRatio に掛ける） */
   resolutionScale?: number
   maxFps?: number
+  /** XR 中に左右の目レイヤーで板ポリを出す（実機未検証） */
+  xrScreen?: boolean
   /**
    * デバッグ表示
    * 0: 通常 / 1: パック深度を距離として可視化 / 2: パックした生バイト
    * 3: Worker の色のみ / 4: 採用マスク（緑 = Worker, 赤 = シーン）
    */
-  debug?: 0 | 1 | 2 | 3 | 4
+  debug?: 0 | 1 | 2 | 3 | 4 | 5
 }
 
 export const DepthComposite: React.FC<DepthCompositeProps> = ({
   enabled = true,
+  stereo = false,
   maxWidth = 1280,
   resolutionScale = 1,
   maxFps = 60,
+  xrScreen = true,
   debug = 0,
 }) => {
   const gl = useThree((state) => state.gl)
@@ -185,6 +273,8 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
   const camera = useThree((state) => state.camera) as PerspectiveCamera
   const size = useThree((state) => state.size)
   const dpr = useThree((state) => state.viewport.dpr)
+
+  const eyeCount = stereo ? 2 : 1
 
   // --- メインシーンを描く HDR ターゲット -----------------------------------
   const target = useMemo(() => {
@@ -205,12 +295,54 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
     return () => target.dispose()
   }, [target])
 
-  // --- Worker の解像度 -----------------------------------------------------
+  // --- 視点（カメラ）--------------------------------------------------------
+  const eyeCameras = useMemo(() => [new PerspectiveCamera(), new PerspectiveCamera()], [])
+  const renderCamerasRef = useRef<PerspectiveCamera[]>([camera])
+  const rightVector = useMemo(() => new Vector3(), [])
+
+  /**
+   * このフレームの視点カメラを返す（Worker へ送るのと、メインシーンの
+   * レンダリングの両方で同じカメラを使う）
+   */
+  const getViewCameras = useCallback(
+    (state: RootState): PerspectiveCamera[] => {
+      // XR 中はブラウザが用意した目のカメラを使う
+      const xrCamera = gl.xr.isPresenting ? (gl.xr.getCamera() as ArrayCamera) : null
+      if (xrCamera && xrCamera.cameras.length >= 2) {
+        const eyes = [xrCamera.cameras[0] as PerspectiveCamera, xrCamera.cameras[1] as PerspectiveCamera]
+        renderCamerasRef.current = eyes
+        return eyes
+      }
+
+      const main = state.camera as PerspectiveCamera
+
+      if (eyeCount === 1) {
+        renderCamerasRef.current = [main]
+        return [main]
+      }
+
+      // モニタ確認用のステレオ: メインカメラを左右にずらす。
+      // 画角はそのまま（横半分の解像度に描き、表示時に横に縮む = SBS ステレオ）
+      rightVector.setFromMatrixColumn(main.matrixWorld, 0).normalize()
+      eyeCameras.forEach((eye, index) => {
+        eye.copy(main)
+        eye.updateProjectionMatrix()
+        eye.position.copy(main.position).addScaledVector(rightVector, index === 0 ? -EYE_OFFSET : EYE_OFFSET)
+        eye.updateMatrixWorld()
+      })
+      renderCamerasRef.current = eyeCameras
+      return eyeCameras
+    },
+    [gl, eyeCount, eyeCameras, rightVector],
+  )
+
+  // --- Worker の解像度（1 視点あたり） --------------------------------------
   const resolution = useMemo(() => {
     const aspect = size.height / Math.max(1, size.width)
-    const width = Math.max(64, Math.min(maxWidth, Math.round(size.width * dpr * resolutionScale)))
+    const totalWidth = size.width * dpr * resolutionScale
+    const width = Math.max(64, Math.min(maxWidth, Math.round(totalWidth / eyeCount)))
     return { width, height: Math.max(1, Math.round(width * aspect)) }
-  }, [size.width, size.height, dpr, maxWidth, resolutionScale])
+  }, [size.width, size.height, dpr, maxWidth, resolutionScale, eyeCount])
 
   const { colorTexture, depthTexture, hasFrame } = useGpuWorker({
     width: resolution.width,
@@ -218,6 +350,7 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
     depth: true,
     maxFps,
     enabled,
+    getViewCameras,
   })
 
   // --- 合成パス ------------------------------------------------------------
@@ -233,6 +366,7 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
         uDepthRange: { value: DEPTH_RANGE },
         uExposure: { value: 1 },
         uWorkerExposure: { value: 1.15 },
+        uEyeCount: { value: 1 },
         uToneMapping: { value: 0 },
         uDebug: { value: 0 },
       },
@@ -260,11 +394,72 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
     }
   }, [composite])
 
+  // --- XR 用の板ポリ（左目 = layer 1 / 右目 = layer 2）--------------------
+  const xrScreens = useMemo(() => {
+    const geometry = createFlippedPlaneGeometry()
+    const meshes = [0, 1].map((eye) => {
+      const material = new ShaderMaterial({
+        uniforms: {
+          uColor: { value: null },
+          uEye: { value: eye },
+          uEyeCount: { value: 2 },
+          uExposure: { value: 1.15 },
+        },
+        vertexShader: screenVertexShader,
+        fragmentShader: screenFragmentShader,
+        depthTest: false,
+        depthWrite: false,
+        toneMapped: false,
+      })
+      const mesh = new Mesh(geometry, material)
+      mesh.visible = false
+      mesh.frustumCulled = false
+      mesh.layers.set(eye === 0 ? 1 : 2) // three の XR は layer 1 = 左目 / 2 = 右目
+      return { mesh, material }
+    })
+    return { geometry, meshes }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      xrScreens.meshes.forEach(({ material }) => material.dispose())
+      xrScreens.geometry.dispose()
+    }
+  }, [xrScreens])
+
+  const xrForward = useMemo(() => new Vector3(), [])
+
   useFrame(() => {
     if (!enabled) return
 
-    // Worker の出力がまだ無い / XR 中は通常描画にフォールバック
-    if (!hasFrame || !depthTexture || gl.xr.isPresenting) {
+    const presenting = gl.xr.isPresenting
+    const xrVisible = presenting && xrScreen && hasFrame
+
+    // XR 中はメインキャンバスへの合成ができないので、目レイヤーの板ポリで出す
+    for (const { mesh, material } of xrScreens.meshes) {
+      mesh.visible = xrVisible
+      if (!xrVisible) continue
+
+      material.uniforms.uColor.value = colorTexture
+      material.uniforms.uExposure.value = gl.toneMappingExposure
+
+      const xrCamera = gl.xr.getCamera() as ArrayCamera
+      xrForward.set(0, 0, -XR_SCREEN_DISTANCE).applyQuaternion(xrCamera.quaternion)
+      mesh.position.copy(xrCamera.position).add(xrForward)
+      mesh.quaternion.copy(xrCamera.quaternion)
+      // 1 視点分のアスペクト
+      const aspect = resolution.width / resolution.height
+      mesh.scale.set(XR_SCREEN_WIDTH, XR_SCREEN_WIDTH / aspect, 1)
+    }
+
+    if (presenting) {
+      // three に左右の目を描かせる（シーン内の板ポリが目ごとに出る）
+      gl.render(scene, camera)
+      return
+    }
+
+    // Worker の出力がまだ無いときは通常描画にフォールバック
+    if (!hasFrame || !depthTexture) {
       gl.render(scene, camera)
       return
     }
@@ -277,14 +472,37 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
     uniforms.uNear.value = camera.near
     uniforms.uFar.value = camera.far
     uniforms.uExposure.value = gl.toneMappingExposure
-    uniforms.uToneMapping.value = gl.toneMapping === ACESFilmicToneMapping ? 4 : gl.toneMapping === LinearToneMapping ? 1 : 0
+    uniforms.uEyeCount.value = eyeCount
+    uniforms.uToneMapping.value =
+      gl.toneMapping === ACESFilmicToneMapping ? 4 : gl.toneMapping === LinearToneMapping ? 1 : 0
     uniforms.uDebug.value = debug
 
+    // メインシーンを視点ごとに描く（RT を横に分割）
+    // 注意: three の setViewport / setScissor は CSS ピクセル指定で、
+    // 内部で pixelRatio が掛かる（フレームバッファの実ピクセルではない）
+    const logicalWidth = size.width
+    const logicalHeight = size.height
+    const eyeWidth = logicalWidth / eyeCount
+    const cameras = renderCamerasRef.current
+
     gl.setRenderTarget(target)
-    gl.render(scene, camera)
+    for (let i = 0; i < eyeCount; i++) {
+      gl.setViewport(i * eyeWidth, 0, eyeWidth, logicalHeight)
+      gl.setScissor(i * eyeWidth, 0, eyeWidth, logicalHeight)
+      gl.setScissorTest(true)
+      gl.render(scene, cameras[i] ?? camera)
+    }
+    gl.setScissorTest(false)
+    gl.setViewport(0, 0, logicalWidth, logicalHeight)
     gl.setRenderTarget(null)
+
     gl.render(composite.scene, composite.camera)
   }, enabled ? 1 : 0)
 
-  return null
+  return (
+    <>
+      <primitive object={xrScreens.meshes[0].mesh} />
+      <primitive object={xrScreens.meshes[1].mesh} />
+    </>
+  )
 }

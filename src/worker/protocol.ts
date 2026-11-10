@@ -24,13 +24,8 @@ export interface ResizeRequest {
   height: number
 }
 
-export interface FrameRequest {
-  type: 'frame'
-  id: number
-  /** 経過秒（Worker 側のアニメーション用） */
-  time: number
-  /** 前フレームからの秒数 */
-  delta: number
+/** 1 視点分のカメラ。2 つ渡すと左右ステレオになる */
+export interface ViewMatrices {
   /** ワールド → ビュー（カメラの matrixWorldInverse） */
   view: Mat4
   /** カメラの projectionMatrix */
@@ -41,6 +36,20 @@ export interface FrameRequest {
     near: number
     far: number
   }
+}
+
+export interface FrameRequest {
+  type: 'frame'
+  id: number
+  /** 経過秒（Worker 側のアニメーション用） */
+  time: number
+  /** 前フレームからの秒数 */
+  delta: number
+  /**
+   * 視点の配列。Worker は横に並べて描く（アトラス）。
+   * 1 要素 = 単眼、2 要素 = ステレオ（[0] が左目、[1] が右目）
+   */
+  views: ViewMatrices[]
 }
 
 export interface DisposeRequest {

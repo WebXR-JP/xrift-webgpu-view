@@ -112,6 +112,40 @@ XR 中は合成できないので通常描画へフォールバックする。
 - `DepthComposite` の `debug` prop で確認できる:
   `1` 距離 / `2` パックした生バイト / `3` Worker の色のみ / `4` 採用マスク（緑=Worker, 赤=シーン）。
 
+## ステレオ（二視点）と XR
+
+`DepthComposite` は `stereo` prop で 2 視点になる。
+
+- フレームメッセージは `views: ViewMatrices[]`（1 要素 = 単眼、2 要素 = 左右）。
+- Worker は **アトラス**（横並び）で描く。キャンバスの横幅は「1 視点ぶん × 視点数」で、
+  `setViewport` / `setScissor` で視点ごとに描き分ける（`applyViewCount` で必要時のみ resize）。
+- メイン側も同じカメラで RT を左右に分けて 2 回描き、合成シェーダが
+  `vUv.x` から視点を選んでアトラスの該当半分を引く。
+- モニタ確認用のステレオは「画角そのまま・横半分の解像度」で描く SBS。
+  画面の左右に同じ視野が横に縮んで並ぶ（`EYE_OFFSET` で眼間距離を調整できる）。
+
+### ハマりどころ
+
+- **`renderer.setViewport` / `setScissor` は CSS ピクセル指定**。three が内部で
+  `pixelRatio` を掛けるので、フレームバッファの実ピクセルを渡すと拡大されて描画が
+  ズレる（画面全体が 1.2 倍にズームしたように見えた）。
+- RT を分割描画するときは `setScissorTest(true)` も必要（クリアが全画面に及ぶため）。
+
+### XR の制約
+
+WebXR 中のフレームバッファはブラウザが所有し、three が左右の目を自前で描く。
+そのため「メインシーンを RT に描いて目ごとに合成する」経路が無く、**深度合成は XR ではできない**。
+
+代わりに XR 中は次の構成にしてある（**実機未検証**）。
+
+- `gl.xr.isPresenting` のときは合成せず `gl.render(scene, camera)` に任せる。
+- シーンに左右の目用の板ポリを置き、three の XR の慣習（**layer 1 = 左目 / layer 2 = 右目**）で
+  振り分ける。three は `cameraXR.layers.mask = camera.layers.mask | 0b110` として
+  目ごとにレイヤーを落とすので、`mesh.layers.set(1)` / `set(2)` で目別に出し分けられる。
+- 目ごとのカメラは `gl.xr.getCamera().cameras[0..1]` から取り、その行列を Worker に送る。
+- 板ポリはヘッド位置 + 前面 2.4m、2.4m 幅で置く（`XR_SCREEN_DISTANCE` / `XR_SCREEN_WIDTH`）。
+  奥行き方向の遮蔽は効かない「ステレオ画面」になる。
+
 ## 実装上のクセ
 
 - `ImageBitmap` は使い終わったら `close()` する。メイン側は 1 フレーム遅らせて解放している
@@ -133,7 +167,8 @@ XR 中は合成できないので通常描画へフォールバックする。
   `flowX/Y/Z` の係数（流れ）、`toneMappingExposure`、ライトの強さ。
 - `WorkerRenderPanel`: `coverage` / `anchor` / `margin`（画面内の位置と大きさ）、
   `maxWidth`（解像度上限）、`maxFps`、`enabled`。
-- `DepthComposite`: `maxWidth` / `resolutionScale` / `maxFps`、`debug`。
+- `DepthComposite`: `stereo`（2 視点）/ `xrScreen`（XR の板ポリ）/ `maxWidth` / `resolutionScale` /
+  `maxFps` / `debug`。
   Worker の露出は `uWorkerExposure`（既定 1.15）。`DEPTH_RANGE` は `worker/gpuWorker.ts` と
   揃える必要がある。
 
