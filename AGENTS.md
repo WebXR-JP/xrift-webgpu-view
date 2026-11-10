@@ -1,104 +1,67 @@
-# XRift World Template - AI ガイド
+# AGENTS.md — @xrift/webgpu-view
 
-## 詳細な API ドキュメントの取得
+Worker の中で WebGPU（three.js の `WebGPURenderer`）で描いたシーンを `ImageBitmap` として受け取り、
+React Three Fiber のキャンバスの **全画面の背景** として出すライブラリ。
 
-詳細な API リファレンス・コードテンプレート・型定義は以下のコマンドで取得できます：
+**このリポジトリはパッケージ本体が主**で、`examples/world` は動作確認用の XRift ワールド（テスト用）。
+
+## 構成
+
+```
+.
+├── src/                  # ライブラリ本体（公開 API）
+│   ├── index.ts          #   メイン入口
+│   ├── GpuBackdrop.tsx   #   全画面の背景（NDC の板ポリ）
+│   ├── useGpuWorker.ts   #   Worker 起動・行列送信・Texture 更新
+│   ├── protocol.ts       #   メイン ⇔ Worker のメッセージ型
+│   ├── worker/           #   Worker 入口（defineGpuWorker）
+│   └── experimental/     #   DepthComposite（深度合成・実験）
+├── vite.config.ts        # ライブラリビルド（3 エントリ / ESM + d.ts）
+├── package.json          # @xrift/webgpu-view（workspaces: examples/*）
+└── examples/world/       # テスト用ワールド（@xrift/webgpu-view-example / private）
+```
+
+| エントリ | 中身 |
+| --- | --- |
+| `@xrift/webgpu-view` | `GpuBackdrop` / `useGpuWorker` / 通信型 |
+| `@xrift/webgpu-view/worker` | `defineGpuWorker` と型（React を巻き込まない） |
+| `@xrift/webgpu-view/experimental` | `DepthComposite`（安定 API ではない） |
+
+## コマンド
 
 ```bash
-npx skills add WebXR-JP/xrift-skills
+npm install
+npm run build           # ライブラリを dist/ にビルド
+npm run typecheck
+npm run dev             # watch ビルド
+
+npm run example:dev     # ライブラリをビルドして examples/world を起動
+npm run example:build
+npm run example:typecheck
+npm run example:upload  # XRift にアップロード（要 xrift login）
+npm run check           # 本体 + ワールドの型チェックとビルド
 ```
 
----
+`examples/world` は `@xrift/webgpu-view` を `file:../..` で参照している。
+`examples/world` 内で `npm run dev` しても `predev` がリポジトリ直下のライブラリをビルドする。
 
-## 最重要ルール（必ず守ること）
+## 必ず守ること
 
-1. **アセット読み込みは必ず `useXRift()` の `baseUrl` を使用**
-2. **アセットファイルは `public/` ディレクトリに配置**
-3. **`baseUrl` は末尾に `/` を含むため、`${baseUrl}path` で結合**（`${baseUrl}/path` は NG）
+1. **`src/` にデモ固有のコードを入れない。** デモは `examples/world` 側に置く。
+2. **公開 API を変えたらルートの `README.md` と `examples/world` の利用箇所も直す。**
+3. **`react` / `three` / `@react-three/fiber` は external。** バンドルに含めない
+   （`vite.config.ts` の `rollupOptions.external`）。
+4. **library は Worker を生成しない。** 生成は利用者側の `?worker` import に任せる
+   （`new Worker(new URL(...))` は `@xrift/code-security` が REJECT するため）。
+5. **`dist` は参照される成果物。** ソースだけ変えても `examples/world` には反映されない。
+6. **ワールド固有の実装メモ** は `examples/world/AGENTS.md` と
+   `examples/world/src/AGENTS.md` にある（描画順 / XR / 深度合成のハマりどころ）。
 
-```typescript
-// ✅ 正しい
-const { baseUrl } = useXRift()
-const model = useGLTF(`${baseUrl}robot.glb`)
-
-// ❌ 間違い
-const model = useGLTF('/robot.glb')           // 絶対パス NG
-const model = useGLTF(`${baseUrl}/robot.glb`) // 余分な / NG
-```
-
----
-
-## shared 依存として利用可能なパッケージ
-
-Module Federation により、以下のパッケージはワールドチャンクにインライン化されず shared チャンクとして分離されます：
-
-- `react`, `react-dom`, `react/jsx-runtime`, `react-dom/client`
-- `three`
-- `three/addons/loaders/GLTFLoader.js`, `three/addons/loaders/DRACOLoader.js`, `three/addons/loaders/KTX2Loader.js`（サブパス単位のみ。バレル全体やその他のアドオンは対象外）
-- `@react-three/fiber`, `@react-three/drei`, `@react-three/rapier`
-- `@react-three/uikit`, `@pmndrs/uikit`
-- `@xrift/world-components`
-
-**Three.js アドオンについて**: DRACOLoader 等の Three.js アドオンは `three/addons/loaders/xxx.js` のサブパスで import してください（`three/addons` バレル全体は shared 対象外）。`three/examples/jsm` からの直接 import はワールドチャンクにインライン化され、`@xrift/code-security` で `new Worker()` が critical 違反として検出される場合があります。
-
-```typescript
-// ✅ 正しい（shared チャンクとして分離される）
-import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js'
-
-// ❌ 間違い（インライン化されセキュリティ違反の可能性）
-import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
-```
-
----
-
-## プロジェクト概要
-
-- **用途**: XRiftプラットフォーム用WebXRワールド
-- **技術**: React Three Fiber + Rapier物理エンジン + Module Federation
-- **動作**: CDNにアップロード後、フロントエンドから動的ロード
-
----
-
-## プロジェクト構造
-
-```
-xrift-world-template/
-├── public/              # アセットファイル（直接配置、サブディレクトリ不要）
-├── src/
-│   ├── components/      # 3Dコンポーネント
-│   ├── World.tsx        # メインワールドコンポーネント
-│   ├── dev.tsx          # 開発用エントリーポイント
-│   ├── index.tsx        # 本番用エクスポート
-│   └── constants.ts     # 定数定義
-├── .triplex/            # Triplex（3Dエディタ）設定
-├── xrift.json           # XRift CLI設定
-├── vite.config.ts       # ビルド設定（Module Federation）
-└── package.json
-```
-
----
-
-## コマンドリファレンス
+## 検証
 
 ```bash
-# 開発
-npm run dev        # 開発サーバー起動 (http://localhost:5173)
-npm run build      # 本番ビルド
-npm run typecheck  # 型チェック
-
-# XRift CLI
-xrift login        # 認証
-xrift create world # 新規ワールドプロジェクト作成
-xrift upload       # アップロード（xrift.json から自動判定）
-xrift whoami       # ログインユーザー確認
-xrift logout       # ログアウト
+npm run check                                  # 型 + ビルド（本体 / ワールド）
+cd examples/world && npx xrift check world     # セキュリティチェック（APPROVE になること）
 ```
 
----
-
-## 実装例の参照先
-
-このテンプレートは最小構成のため、実装例は以下のみです。その他のコンポーネント（VideoPlayer、Interactable等）の使い方は [XRift ドキュメント](https://docs.xrift.net) を参照してください。
-
-- **Skybox**: `src/components/Skybox/index.tsx`
-- **メインワールド**: `src/World.tsx`
+XR は実機（PICO 4 など）が必要。未検証の経路を触ったら、その旨をコミットメッセージに書く。

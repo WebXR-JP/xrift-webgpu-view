@@ -1,20 +1,24 @@
 # src/AGENTS.md — WebGPU Worker ビューの実装メモ
 
 このワールドは「Worker で WebGPU 描画した結果を、メインの Three.js（WebGL）キャンバスの
-背景として出す」デモ。仕組みは `packages/webgpu-view`（`@xrift/webgpu-view`）に切り出してある。
+背景として出す」デモ。仕組みはリポジトリ直下の `src/`（`@xrift/webgpu-view`）にある。
+このディレクトリ（`examples/world`）はライブラリの動作確認用で、パッケージ本体ではない。
 
 ## ファイル構成
 
 | パス | 役割 |
 | --- | --- |
-| `packages/webgpu-view/src/worker/defineGpuWorker.ts` | Worker 側ランタイム（レンダラ生成 / カメラ反映 / アトラス描画 / 転送） |
-| `packages/webgpu-view/src/worker/types.ts` | シーン側の型（`GpuWorkerScene` / `GpuWorkerInit`） |
-| `packages/webgpu-view/src/useGpuWorker.ts` | Worker 起動・行列送信・`ImageBitmap` → `Texture` |
-| `packages/webgpu-view/src/GpuBackdrop.tsx` | 全画面の背景（NDC の板ポリ。通常 / SBS / XR） |
-| `packages/webgpu-view/src/experimental/DepthComposite.tsx` | 深度合成（実験・XR 非対応） |
+| `<repo>/src/worker/defineGpuWorker.ts` | Worker 側ランタイム（レンダラ生成 / カメラ反映 / アトラス描画 / 転送） |
+| `<repo>/src/worker/types.ts` | シーン側の型（`GpuWorkerScene` / `GpuWorkerInit`） |
+| `<repo>/src/useGpuWorker.ts` | Worker 起動・行列送信・`ImageBitmap` → `Texture` |
+| `<repo>/src/GpuBackdrop.tsx` | 全画面の背景（NDC の板ポリ。通常 / SBS / XR） |
+| `<repo>/src/experimental/DepthComposite.tsx` | 深度合成（実験・XR 非対応） |
 | `src/worker/demoScene.ts` | デモのコーネルボックス + GPU パーティクル |
 | `src/worker/demo.worker.ts` | `defineGpuWorker` を呼ぶだけの Worker エントリ |
 | `src/World.tsx` | `USE_COMPOSITE` / `STEREO` で切り替え |
+
+`<repo>` はリポジトリ直下（このディレクトリから見て `../..`）。ライブラリ本体のファイルは
+パッケージとして公開されるので、デモ固有のコードを混ぜないこと。
 
 流れ: `useFrame` で視点カメラの `matrixWorldInverse` / `projectionMatrix` を送信 →
 Worker が同じ視点で描画 → `transferToImageBitmap()` → `postMessage(bitmap, [bitmap])` →
@@ -37,10 +41,11 @@ import DemoWorker from './worker/demo.worker.ts?worker'
 
 ### 2. ライブラリの変更はビルドしてから使う
 
-`@xrift/webgpu-view` は `dist` を参照している（npm workspaces）。`packages/` を編集したら
+`@xrift/webgpu-view` は `dist` を参照している（`file:../..` の npm workspaces）。
+ライブラリ本体（リポジトリ直下の `src/`）を編集したら
 
 ```bash
-npm run build:lib   # npm run build -w @xrift/webgpu-view
+npm run build:lib   # = npm run build --prefix ../..（リポジトリ直下の npm run build）
 ```
 
 `npm run dev` / `build` / `typecheck` は先頭で自動実行する（`predev` / `prebuild` / `pretypecheck`）。
@@ -210,10 +215,15 @@ WebGL2 には `gl_FragDepth` が無いので、**深度を「書く」ことは�
 ## 検証手順
 
 ```bash
+# examples/world 内で
 npm run typecheck
-npm run dev                     # http://localhost:5173
+npm run dev                     # http://localhost:5173（predev でライブラリもビルド）
 npm run build && npx vite preview
 npx xrift check world           # 23 files APPROVE になること
+
+# リポジトリ直下から
+npm run example:dev             # ライブラリをビルドしてからワールドを起動
+npm run check                   # 本体 + ワールドの型チェックとビルド
 ```
 
 `debug` を付けるとコンソールに `[webgpu-view] ready: ...` と fps が出る。

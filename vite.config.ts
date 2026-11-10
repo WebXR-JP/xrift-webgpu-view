@@ -1,91 +1,43 @@
-import react from '@vitejs/plugin-react'
-import path from 'path'
+import { resolve } from 'node:path'
 import { defineConfig } from 'vite'
 import dts from 'vite-plugin-dts'
-import federation from '@originjs/vite-plugin-federation'
-import { xriftDev } from '@xrift/sdk/vite'
 
+/**
+ * ライブラリビルド
+ *
+ * - メインスレッド用（three = WebGL）
+ * - Worker 用（three/webgpu）
+ * - 実験用（深度合成）
+ *
+ * を別エントリにしている。Worker 用の入口が React を読み込まないようにするため。
+ * react / three / @react-three/fiber は利用者側のものを使う（external）。
+ */
 export default defineConfig({
-  plugins: [
-    react(),
-    // <Item itemId> をローカルでも本番と同じバンドルで動かすための中継（要 xrift login）
-    xriftDev(),
-    dts({
-      insertTypesEntry: true,
-    }),
-    federation({
-      name: 'xrift_webgpu_test',
-      filename: 'remoteEntry.js',
-      exposes: {
-        './World': './src/index.tsx',
-      },
-      shared: {
-        react: {
-          singleton: true,
-          requiredVersion: '*',
-        },
-        'react-dom': {
-          singleton: true,
-          requiredVersion: '*',
-        },
-        'react-dom/client': {
-          singleton: true,
-        },
-        'react/jsx-runtime': {
-          singleton: true,
-        },
-        three: {
-          singleton: true,
-          requiredVersion: '*',
-        },
-        'three/addons/loaders/GLTFLoader.js': {
-          singleton: true,
-        },
-        'three/addons/loaders/DRACOLoader.js': {
-          singleton: true,
-        },
-        'three/addons/loaders/KTX2Loader.js': {
-          singleton: true,
-        },
-        '@react-three/fiber': {
-          singleton: true,
-          requiredVersion: '*',
-        },
-        '@react-three/rapier': {
-          singleton: true,
-          requiredVersion: '*',
-        },
-        '@react-three/drei': {
-          singleton: true,
-          requiredVersion: '*',
-        },
-        '@react-three/uikit': {
-          singleton: true,
-          requiredVersion: '*',
-        },
-        '@pmndrs/uikit': {
-          singleton: true,
-          requiredVersion: '*',
-        },
-        '@xrift/world-components': {
-          singleton: true,
-          requiredVersion: '*',
-        },
-      },
-    }),
-  ],
   build: {
     target: 'esnext',
     minify: false,
-    cssCodeSplit: false,
-    assetsDir: '',
-  },
-  resolve: {
-    alias: {
-      '~': path.resolve(__dirname, './src'),
+    sourcemap: true,
+    emptyOutDir: true,
+    lib: {
+      entry: {
+        index: resolve(__dirname, 'src/index.ts'),
+        'worker/index': resolve(__dirname, 'src/worker/index.ts'),
+        'experimental/index': resolve(__dirname, 'src/experimental/index.ts'),
+      },
+      formats: ['es'],
+    },
+    rollupOptions: {
+      external: (id) => /^(three|react|react-dom|@react-three\/fiber)(\/|$)/.test(id),
+      output: {
+        entryFileNames: '[name].js',
+        chunkFileNames: 'chunks/[name]-[hash].js',
+      },
     },
   },
-  define: {
-    global: 'globalThis',
-  },
+  plugins: [
+    dts({
+      entryRoot: 'src',
+      include: ['src'],
+    }),
+  ],
 })

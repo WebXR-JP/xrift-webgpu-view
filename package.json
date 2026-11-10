@@ -1,66 +1,57 @@
 {
-  "name": "@xrift/webgpu-test",
+  "name": "@xrift/webgpu-view",
   "version": "0.1.0",
-  "description": "XRift world template for creating WebXR experiences with React Three Fiber and physics simulation",
+  "description": "Run a WebGPU scene in a Worker and show it in a React Three Fiber canvas (monitor and XR).",
   "type": "module",
-  "main": "./dist/remoteEntry.js",
-  "module": "./dist/remoteEntry.js",
-  "types": "./dist/index.d.ts",
+  "license": "MIT",
+  "sideEffects": [
+    "./dist/worker/index.js"
+  ],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "exports": {
     ".": {
-      "import": "./dist/remoteEntry.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker/index.d.ts",
+      "import": "./dist/worker/index.js"
+    },
+    "./experimental": {
+      "types": "./dist/experimental/index.d.ts",
+      "import": "./dist/experimental/index.js"
     }
   },
-  "files": [
-    "dist"
-  ],
   "scripts": {
-    "dev": "vite",
-    "predev": "npm run build:lib",
-    "build": "tsc && vite build",
-    "prebuild": "npm run build:lib",
-    "preview": "vite preview",
+    "build": "vite build",
+    "dev": "vite build --watch",
     "typecheck": "tsc --noEmit",
-    "pretypecheck": "npm run build:lib",
-    "build:lib": "npm run build -w @xrift/webgpu-view",
-    "dev:lib": "npm run dev -w @xrift/webgpu-view"
+    "example:dev": "npm run dev -w @xrift/webgpu-view-example",
+    "example:build": "npm run build -w @xrift/webgpu-view-example",
+    "example:typecheck": "npm run typecheck -w @xrift/webgpu-view-example",
+    "example:upload": "npm run upload -w @xrift/webgpu-view-example",
+    "check": "npm run typecheck && npm run build && npm run example:typecheck && npm run example:build"
   },
   "peerDependencies": {
-    "@react-three/drei": "^10.7.3",
-    "@react-three/fiber": "^9.3.0",
-    "@react-three/rapier": "^2.1.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "three": "^0.183.1"
+    "@react-three/fiber": ">=9",
+    "react": ">=19",
+    "three": ">=0.183"
   },
   "devDependencies": {
-    "@originjs/vite-plugin-federation": "^1.4.1",
-    "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.5.0",
-    "@react-three/rapier": "^2.2.0",
-    "@react-three/uikit": "^1.0.64",
     "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3",
     "@types/three": "^0.183.1",
-    "@vitejs/plugin-react": "^5.1.4",
-    "@xrift/sdk": "^0.2.1",
-    "baseline-browser-mapping": "^2.10.0",
+    "@webgpu/types": "^0.1.66",
     "react": "~19.2.4",
-    "react-dom": "~19.2.4",
     "three": "^0.183.1",
     "typescript": "^5.6.2",
     "vite": "^7.3.1",
     "vite-plugin-dts": "^4.0.0"
   },
-  "publishConfig": {
-    "access": "public"
-  },
-  "dependencies": {
-    "@xrift/webgpu-view": "^0.1.0",
-    "@xrift/world-components": "^0.63.0"
-  },
   "workspaces": [
-    "packages/*"
+    "examples/*"
   ]
 }

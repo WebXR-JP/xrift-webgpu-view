@@ -32,3 +32,10 @@ updates:
           - "vite-*"
           - "@vitejs*"
           - "@originjs/vite-*"
+  - package-ecosystem: npm
+    directory: "/examples/world"
+    schedule:
+      interval: daily
+      time: "09:00"
+      timezone: "Asia/Tokyo"
+    open-pull-requests-limit: 5
