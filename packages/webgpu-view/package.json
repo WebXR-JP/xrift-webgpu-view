@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "description": "Run a WebGPU scene in a Worker and show it in a React Three Fiber canvas (monitor and XR).",
   "type": "module",
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/worker/index.js"
+  ],
   "files": [
     "dist",
     "README.md"
