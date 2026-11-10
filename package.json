@@ -17,9 +17,14 @@
   ],
   "scripts": {
     "dev": "vite",
+    "predev": "npm run build:lib",
     "build": "tsc && vite build",
+    "prebuild": "npm run build:lib",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "pretypecheck": "npm run build:lib",
+    "build:lib": "npm run build -w @xrift/webgpu-view",
+    "dev:lib": "npm run dev -w @xrift/webgpu-view"
   },
   "peerDependencies": {
     "@react-three/drei": "^10.7.3",
@@ -52,6 +57,10 @@
     "access": "public"
   },
   "dependencies": {
+    "@xrift/webgpu-view": "^0.1.0",
     "@xrift/world-components": "^0.63.0"
-  }
+  },
+  "workspaces": [
+    "packages/*"
+  ]
 }

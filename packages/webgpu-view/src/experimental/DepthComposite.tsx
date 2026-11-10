@@ -1,5 +1,8 @@
 /**
- * Worker の色 + 深度を、メインシーンの深度と合成してメインキャンバスに描く
+ * メインシーンの深度と Worker の深度を比較して、全画面に合成する（実験的）
+ *
+ * これはライブラリの安定 API ではない。`@xrift/webgpu-view/experimental` からの
+ * 直接 import でだけ使える。通常は `GpuWorkerView` を使うこと。
  *
  * 仕組み:
  * 1. メインシーンを HDR のレンダーターゲット（色 + DepthTexture）へ描く
@@ -13,16 +16,9 @@
  * WebGL2 には gl_FragDepth が無いため、深度を「書く」のではなく
  * 深度を比較して色を選ぶ方式にしている。
  *
- * ステレオ（stereo）:
- *   左右の視点をアトラス（横並び）で Worker に描かせ、メインシーンも
- *   左右 2 回描いて、画面の左右に並べて出す（モニタでの確認用）。
- *
- * XR:
- *   合成はできない（WebXR のフレームバッファはブラウザが持っており、
- *   メインシーンを RT に描いて目ごとに合成する経路が無い）。
- *   代わりに XR 中は「左右の目レイヤーに分けた板ポリ」に Worker の
- *   左右画像を貼る（three の XR は layer 1 = 左目 / layer 2 = 右目）。
- *   この経路は実機未検証。
+ * **XR では動かない。** WebXR のフレームバッファはブラウザが所有しており、
+ * メインシーンを自分の RT に描いてから目ごとに合成する経路が無い。
+ * XR 中は Worker を出さずに通常描画へフォールバックする。
  */
 
 import { useFrame, useThree } from '@react-three/fiber'
@@ -44,16 +40,13 @@ import {
   Vector3,
   WebGLRenderTarget,
 } from 'three'
-import { useGpuWorker } from '../../gpu-worker/useGpuWorker'
+import { useGpuWorker } from '../useGpuWorker'
+import type { WorkerConstructor } from '../useGpuWorker'
 
-/** Worker 側の深度パック範囲（worker/gpuWorker.ts の DEPTH_RANGE と合わせる） */
+/** Worker 側の深度パック範囲（worker/defineGpuWorker.ts の DEPTH_RANGE と合わせる） */
 const DEPTH_RANGE = 50
 /** ステレオ確認用の眼間距離の半分（メートル） */
 const EYE_OFFSET = 0.032
-/** XR で板ポリを置く距離（メートル） */
-const XR_SCREEN_DISTANCE = 2.4
-/** XR の板ポリの横幅（メートル） */
-const XR_SCREEN_WIDTH = 2.4
 
 const vertexShader = /* glsl */ `
 varying vec2 vUv;
@@ -199,73 +192,35 @@ void main() {
 }
 `
 
-const screenVertexShader = /* glsl */ `
-varying vec2 vUv;
-
-void main() {
-  vUv = uv;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-}
-`
-
-/** XR 用: アトラスの片目分を板ポリに貼る */
-const screenFragmentShader = /* glsl */ `
-precision highp float;
-
-varying vec2 vUv;
-
-uniform sampler2D uColor;
-uniform float uEye;
-uniform float uEyeCount;
-uniform float uExposure;
-
-${TONE_MAPPING_CHUNK}
-
-void main() {
-  vec2 uv = vec2((uEye + vUv.x) / uEyeCount, vUv.y);
-  vec3 color = texture2D(uColor, uv).rgb;
-  color = acesFilmic(color * (uExposure / 0.6));
-  gl_FragColor = vec4(linearToSRGB(color), 1.0);
-}
-`
-
-/** 板ポリの UV を上下反転する（ImageBitmap は flipY が効かないため） */
-function createFlippedPlaneGeometry() {
-  const geometry = new PlaneGeometry(1, 1)
-  const uv = geometry.getAttribute('uv')
-  for (let i = 0; i < uv.count; i++) {
-    uv.setY(i, 1 - uv.getY(i))
-  }
-  uv.needsUpdate = true
-  return geometry
-}
-
 export interface DepthCompositeProps {
+  /** `import MyWorker from './my.worker.ts?worker'` の既定エクスポート */
+  worker: WorkerConstructor
+  /** Worker の起動時に 1 回だけ渡す任意のデータ */
+  workerData?: unknown
   enabled?: boolean
   /** 左右 2 視点で描く（モニタでは左右に並べて表示される） */
   stereo?: boolean
-  /** Worker 側の描画解像度の上限（横幅 px） */
+  /** Worker 側の描画解像度の上限（1 視点ぶんの横幅 px） */
   maxWidth?: number
   /** 解像度スケール（devicePixelRatio に掛ける） */
   resolutionScale?: number
   maxFps?: number
-  /** XR 中に左右の目レイヤーで板ポリを出す（実機未検証） */
-  xrScreen?: boolean
   /**
    * デバッグ表示
    * 0: 通常 / 1: パック深度を距離として可視化 / 2: パックした生バイト
-   * 3: Worker の色のみ / 4: 採用マスク（緑 = Worker, 赤 = シーン）
+   * 3: Worker の色のみ / 4: 採用マスク（緑 = Worker, 赤 = シーン）/ 5: アトラス全体
    */
   debug?: 0 | 1 | 2 | 3 | 4 | 5
 }
 
 export const DepthComposite: React.FC<DepthCompositeProps> = ({
+  worker,
+  workerData,
   enabled = true,
   stereo = false,
   maxWidth = 1280,
   resolutionScale = 1,
   maxFps = 60,
-  xrScreen = true,
   debug = 0,
 }) => {
   const gl = useThree((state) => state.gl)
@@ -300,13 +255,10 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
   const renderCamerasRef = useRef<PerspectiveCamera[]>([camera])
   const rightVector = useMemo(() => new Vector3(), [])
 
-  /**
-   * このフレームの視点カメラを返す（Worker へ送るのと、メインシーンの
-   * レンダリングの両方で同じカメラを使う）
-   */
+  /** このフレームの視点カメラを返す（Worker へ送るのと、メインシーンの描画で同じものを使う） */
   const getViewCameras = useCallback(
     (state: RootState): PerspectiveCamera[] => {
-      // XR 中はブラウザが用意した目のカメラを使う
+      // XR 中はブラウザが用意した目のカメラを使う（合成自体は XR では行わない）
       const xrCamera = gl.xr.isPresenting ? (gl.xr.getCamera() as ArrayCamera) : null
       if (xrCamera && xrCamera.cameras.length >= 2) {
         const eyes = [xrCamera.cameras[0] as PerspectiveCamera, xrCamera.cameras[1] as PerspectiveCamera]
@@ -321,12 +273,10 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
         return [main]
       }
 
-      // モニタ確認用のステレオ: メインカメラを左右にずらす。
-      // 画角はそのまま（横半分の解像度に描き、表示時に横に縮む = SBS ステレオ）
+      // モニタ確認用のステレオ: メインカメラを左右にずらす（画角はそのまま）
       rightVector.setFromMatrixColumn(main.matrixWorld, 0).normalize()
       eyeCameras.forEach((eye, index) => {
         eye.copy(main)
-        eye.updateProjectionMatrix()
         eye.position.copy(main.position).addScaledVector(rightVector, index === 0 ? -EYE_OFFSET : EYE_OFFSET)
         eye.updateMatrixWorld()
       })
@@ -345,9 +295,11 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
   }, [size.width, size.height, dpr, maxWidth, resolutionScale, eyeCount])
 
   const { colorTexture, depthTexture, hasFrame } = useGpuWorker({
+    worker,
+    workerData,
     width: resolution.width,
     height: resolution.height,
-    depth: true,
+    internalDepth: true,
     maxFps,
     enabled,
     getViewCameras,
@@ -394,66 +346,11 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
     }
   }, [composite])
 
-  // --- XR 用の板ポリ（左目 = layer 1 / 右目 = layer 2）--------------------
-  const xrScreens = useMemo(() => {
-    const geometry = createFlippedPlaneGeometry()
-    const meshes = [0, 1].map((eye) => {
-      const material = new ShaderMaterial({
-        uniforms: {
-          uColor: { value: null },
-          uEye: { value: eye },
-          uEyeCount: { value: 2 },
-          uExposure: { value: 1.15 },
-        },
-        vertexShader: screenVertexShader,
-        fragmentShader: screenFragmentShader,
-        depthTest: false,
-        depthWrite: false,
-        toneMapped: false,
-      })
-      const mesh = new Mesh(geometry, material)
-      mesh.visible = false
-      mesh.frustumCulled = false
-      mesh.layers.set(eye === 0 ? 1 : 2) // three の XR は layer 1 = 左目 / 2 = 右目
-      return { mesh, material }
-    })
-    return { geometry, meshes }
-  }, [])
-
-  useEffect(() => {
-    return () => {
-      xrScreens.meshes.forEach(({ material }) => material.dispose())
-      xrScreens.geometry.dispose()
-    }
-  }, [xrScreens])
-
-  const xrForward = useMemo(() => new Vector3(), [])
-
   useFrame(() => {
     if (!enabled) return
 
-    const presenting = gl.xr.isPresenting
-    const xrVisible = presenting && xrScreen && hasFrame
-
-    // XR 中はメインキャンバスへの合成ができないので、目レイヤーの板ポリで出す
-    for (const { mesh, material } of xrScreens.meshes) {
-      mesh.visible = xrVisible
-      if (!xrVisible) continue
-
-      material.uniforms.uColor.value = colorTexture
-      material.uniforms.uExposure.value = gl.toneMappingExposure
-
-      const xrCamera = gl.xr.getCamera() as ArrayCamera
-      xrForward.set(0, 0, -XR_SCREEN_DISTANCE).applyQuaternion(xrCamera.quaternion)
-      mesh.position.copy(xrCamera.position).add(xrForward)
-      mesh.quaternion.copy(xrCamera.quaternion)
-      // 1 視点分のアスペクト
-      const aspect = resolution.width / resolution.height
-      mesh.scale.set(XR_SCREEN_WIDTH, XR_SCREEN_WIDTH / aspect, 1)
-    }
-
-    if (presenting) {
-      // three に左右の目を描かせる（シーン内の板ポリが目ごとに出る）
+    // XR 中はブラウザ所有のフレームバッファに合成できないので通常描画
+    if (gl.xr.isPresenting) {
       gl.render(scene, camera)
       return
     }
@@ -499,10 +396,5 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
     gl.render(composite.scene, composite.camera)
   }, enabled ? 1 : 0)
 
-  return (
-    <>
-      <primitive object={xrScreens.meshes[0].mesh} />
-      <primitive object={xrScreens.meshes[1].mesh} />
-    </>
-  )
+  return null
 }

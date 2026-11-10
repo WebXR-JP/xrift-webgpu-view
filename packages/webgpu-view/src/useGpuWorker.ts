@@ -2,40 +2,72 @@
  * Worker の WebGPU 描画をメインスレッドから使うためのフック
  *
  * - Worker の起動 / init / resize / 破棄
- * - 毎フレーム、メインカメラの行列を送って 1 フレーム 1 リクエストで描かせる
- * - 返ってきた ImageBitmap（色 + 任意で深度）をテクスチャへ反映する
+ * - 毎フレーム、視点カメラの行列を送って 1 フレーム 1 リクエストで描かせる
+ * - 返ってきた ImageBitmap（色）をテクスチャへ反映する
  *
  * ImageBitmap は WebGL の `UNPACK_FLIP_Y_WEBGL` が効かないため、テクスチャは
- * 上下反転した状態で入る。使う側で UV を反転するか、サンプリング時に V を反転する。
+ * 上下反転した状態で入る。使う側でサンプリング時に V を反転する。
  */
 
 import { useFrame } from '@react-three/fiber'
 import type { RootState } from '@react-three/fiber'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { LinearFilter, NearestFilter, PerspectiveCamera, SRGBColorSpace, Texture } from 'three'
-import GpuWorker from '../worker/gpuWorker.ts?worker'
-import type { FrameRequest, ViewMatrices, WorkerRequest, WorkerResponse } from '../worker/protocol'
+import type { WorkerResponse } from './protocol'
+import type { FrameRequest, ViewMatrices } from './protocol'
 
-export interface UseGpuWorkerOptions {
-  /** Worker の描画解像度 */
+/** Vite の `?worker` import が返すコンストラクタ */
+export type WorkerConstructor = new () => Worker
+
+export interface GpuWorkerReadyInfo {
+  /** 1 視点ぶんのサイズ（px） */
   width: number
   height: number
-  /** 深度画像も受け取る（毎フレーム 2 パス描画になる） */
-  depth?: boolean
+  /** 実行中のバックエンド（基本は 'webgpu'） */
+  backend: string
+  /** アダプタ情報（取れない環境では空文字） */
+  adapter: string
+  /** シーン側が返した任意の情報 */
+  meta?: Record<string, unknown>
+}
+
+export interface UseGpuWorkerOptions {
+  /** `import MyWorker from './my.worker.ts?worker'` の既定エクスポート */
+  worker: WorkerConstructor
+  /**
+   * Worker の起動時に 1 回だけ渡す任意のデータ。
+   * シーン側では `GpuWorkerInit.data` で受け取る。
+   */
+  workerData?: unknown
+  /** 1 視点ぶんの描画解像度 */
+  width: number
+  height: number
+  /** Worker を描画する最大頻度（既定 60） */
   maxFps?: number
   enabled?: boolean
   /**
-   * 視点を返す関数。1 要素なら単眼、2 要素ならステレオ（[0]=左目, [1]=右目）。
+   * 視点を返す関数。1 要素なら単眼、2 要素ならステレオ（[0] = 左目, [1] = 右目）。
    * 省略時はメインカメラ 1 視点。
-   * 呼ばれた時点のメインカメラを読んで、その場で視点を作る用途を想定している。
    */
   getViewCameras?: (state: RootState) => PerspectiveCamera[]
+  onReady?: (info: GpuWorkerReadyInfo) => void
+  onError?: (message: string) => void
+  /** コンソールに ready / fps を出す（既定 false） */
+  debug?: boolean
+  /**
+   * 深度画像も受け取る（毎フレーム 2 パス描画になる）。
+   * @internal experimental/DepthComposite 専用。
+   */
+  internalDepth?: boolean
 }
 
 export interface UseGpuWorkerResult {
   /** 描画結果（色）。ImageBitmap なので上下が反転している */
   colorTexture: Texture
-  /** 距離を R,G に 16bit でパックした画像（depth: true のときのみ） */
+  /**
+   * 距離を R,G に 16bit でパックした画像（internalDepth: true のときのみ）
+   * @internal
+   */
   depthTexture: Texture | null
   /** 最初のフレームを受け取ったか */
   hasFrame: boolean
@@ -54,12 +86,17 @@ function createTexture(nearest: boolean) {
 }
 
 export function useGpuWorker({
+  worker: WorkerClass,
+  workerData,
   width,
   height,
-  depth = false,
   maxFps = 60,
   enabled = true,
   getViewCameras,
+  onReady,
+  onError,
+  debug = false,
+  internalDepth = false,
 }: UseGpuWorkerOptions): UseGpuWorkerResult {
   const workerRef = useRef<Worker | null>(null)
   const readyRef = useRef(false)
@@ -77,8 +114,8 @@ export function useGpuWorker({
   const [error, setError] = useState<string | null>(null)
 
   const textures = useMemo(
-    () => ({ color: createTexture(false), depth: depth ? createTexture(true) : null }),
-    [depth],
+    () => ({ color: createTexture(false), depth: internalDepth ? createTexture(true) : null }),
+    [internalDepth],
   )
 
   useEffect(() => {
@@ -88,17 +125,27 @@ export function useGpuWorker({
     }
   }, [textures])
 
-  const optionsRef = useRef({ width, height, depth })
-  optionsRef.current = { width, height, depth }
+  const optionsRef = useRef({ width, height, internalDepth, workerData })
+  optionsRef.current = { width, height, internalDepth, workerData }
 
   const getViewCamerasRef = useRef(getViewCameras)
   getViewCamerasRef.current = getViewCameras
 
+  const onReadyRef = useRef(onReady)
+  onReadyRef.current = onReady
+
+  const onErrorRef = useRef(onError)
+  onErrorRef.current = onError
+
+  const debugRef = useRef(debug)
+  debugRef.current = debug
+
   // --- Worker 起動 ---------------------------------------------------------
   useEffect(() => {
-    const worker = new GpuWorker()
+    const worker = new WorkerClass()
     workerRef.current = worker
     readyRef.current = false
+    setHasFrame(false)
 
     worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       const message = event.data
@@ -106,16 +153,27 @@ export function useGpuWorker({
       if (message.type === 'ready') {
         readyRef.current = true
         setError(null)
-        console.info(
-          `[worker-render] ready: ${message.backend} ${message.adapter} / ${message.width}x${message.height} / ${message.particles.toLocaleString()} particles`,
-        )
+        onReadyRef.current?.({
+          width: message.width,
+          height: message.height,
+          backend: message.backend,
+          adapter: message.adapter,
+          meta: message.meta,
+        })
+        if (debugRef.current) {
+          console.info(
+            `[webgpu-view] ready: ${message.backend} ${message.adapter} / ${message.width}x${message.height}`,
+            message.meta ?? '',
+          )
+        }
         return
       }
 
       if (message.type === 'error') {
         readyRef.current = false
         setError(message.message)
-        console.error('[worker-render]', message.message)
+        onErrorRef.current?.(message.message)
+        console.error('[webgpu-view]', message.message)
         return
       }
 
@@ -123,10 +181,12 @@ export function useGpuWorker({
       stats.current.frames++
       stats.current.renderMs += message.renderMs
 
-      if (stats.current.frames >= 120) {
+      if (debugRef.current && stats.current.frames >= 120) {
         const fps = (stats.current.frames * 1000) / (performance.now() - stats.current.since)
         console.info(
-          `[worker-render] ${fps.toFixed(1)} fps / ${message.width}x${message.height} / worker render ${(stats.current.renderMs / stats.current.frames).toFixed(2)} ms`,
+          `[webgpu-view] ${fps.toFixed(1)} fps / ${message.width}x${message.height} / worker render ${(
+            stats.current.renderMs / stats.current.frames
+          ).toFixed(2)} ms`,
         )
         stats.current = { frames: 0, renderMs: 0, since: performance.now() }
       }
@@ -143,11 +203,12 @@ export function useGpuWorker({
 
     worker.onerror = (event) => {
       setError(event.message)
-      console.error('[worker-render] worker error:', event.message)
+      onErrorRef.current?.(event.message)
+      console.error('[webgpu-view] worker error:', event.message)
     }
 
-    const { width: w, height: h, depth: d } = optionsRef.current
-    worker.postMessage({ type: 'init', width: w, height: h, depth: d } satisfies WorkerRequest)
+    const { width: w, height: h, internalDepth: d, workerData: data } = optionsRef.current
+    worker.postMessage({ type: 'init', width: w, height: h, depth: d, data })
 
     return () => {
       workerRef.current = null
@@ -163,11 +224,11 @@ export function useGpuWorker({
       depthRetired.current = null
       worker.terminate()
     }
-  }, [])
+  }, [WorkerClass])
 
   // --- リサイズ -----------------------------------------------------------
   useEffect(() => {
-    workerRef.current?.postMessage({ type: 'resize', width, height } satisfies WorkerRequest)
+    workerRef.current?.postMessage({ type: 'resize', width, height })
   }, [width, height])
 
   // --- 毎フレーム: テクスチャ更新 + カメラ送信 -----------------------------

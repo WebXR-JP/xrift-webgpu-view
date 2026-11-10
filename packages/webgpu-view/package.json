@@ -1,0 +1,46 @@
+{
+  "name": "@xrift/webgpu-view",
+  "version": "0.1.0",
+  "description": "Run a WebGPU scene in a Worker and show it in a React Three Fiber canvas (monitor and XR).",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker/index.d.ts",
+      "import": "./dist/worker/index.js"
+    },
+    "./experimental": {
+      "types": "./dist/experimental/index.d.ts",
+      "import": "./dist/experimental/index.js"
+    }
+  },
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@react-three/fiber": ">=9",
+    "react": ">=19",
+    "three": ">=0.183"
+  },
+  "devDependencies": {
+    "@react-three/fiber": "^9.5.0",
+    "@types/react": "^19.2.14",
+    "@types/three": "^0.183.1",
+    "@webgpu/types": "^0.1.66",
+    "react": "~19.2.4",
+    "three": "^0.183.1",
+    "typescript": "^5.6.2",
+    "vite": "^7.3.1",
+    "vite-plugin-dts": "^4.0.0"
+  }
+}

@@ -9,17 +9,22 @@ export type Mat4 = number[]
 
 export interface InitRequest {
   type: 'init'
+  /** 1 視点ぶんの横幅（px）。キャンバスはこれを視点数ぶん横に並べたアトラスになる */
   width: number
+  /** 1 視点ぶんの高さ（px） */
   height: number
   /**
    * 深度画像（距離を R,G の 16bit でパックした RGBA8）も返すか。
-   * 深度合成を使うときだけ有効にする（毎フレーム 2 回描画 + 転送になる）
+   * @internal experimental/DepthComposite 専用。通常のビューでは使わない。
    */
   depth?: boolean
+  /** シーン側へ渡す任意のデータ（structured clone できるもの） */
+  data?: unknown
 }
 
 export interface ResizeRequest {
   type: 'resize'
+  /** 1 視点ぶんのサイズ */
   width: number
   height: number
 }
@@ -60,13 +65,15 @@ export type WorkerRequest = InitRequest | ResizeRequest | FrameRequest | Dispose
 
 export interface ReadyResponse {
   type: 'ready'
+  /** 1 視点ぶんのサイズ */
   width: number
   height: number
   /** 実行中のバックエンド（基本は 'webgpu'） */
   backend: string
   /** アダプタ情報（取れない環境では空文字） */
   adapter: string
-  particles: number
+  /** シーン側が返した任意の情報（パーティクル数など） */
+  meta?: Record<string, unknown>
 }
 
 export interface ErrorResponse {
@@ -77,9 +84,11 @@ export interface ErrorResponse {
 export interface FrameResponse {
   type: 'result'
   id: number
+  /** アトラス全体（幅 = 1 視点ぶん × 視点数） */
   bitmap: ImageBitmap
   /** depth: true のときだけ。R,G に 16bit 距離がパックされている */
   depthBitmap?: ImageBitmap
+  /** アトラス全体のサイズ */
   width: number
   height: number
   /** Worker 側で 1 フレーム描画に要した時間（ms） */
