@@ -190,7 +190,7 @@ WebGL2 には `gl_FragDepth` が無いので、**深度を「書く」ことは�
 npm run typecheck
 npm run dev                     # http://localhost:5173
 npm run build && npx vite preview
-npx xrift check world           # 24 files APPROVE になること
+npx xrift check world           # 23 files APPROVE になること
 ```
 
 `debug` を付けるとコンソールに `[webgpu-view] ready: ...` と fps が出る。
