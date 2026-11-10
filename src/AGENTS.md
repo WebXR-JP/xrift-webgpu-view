@@ -45,6 +45,9 @@ npm run build:lib   # npm run build -w @xrift/webgpu-view
 
 `npm run dev` / `build` / `typecheck` は先頭で自動実行する（`predev` / `prebuild` / `pretypecheck`）。
 
+開発中に `dist` を書き換えると Vite の HMR が乱れて画面が真っ白になることがある。
+ライブラリをビルドしたらブラウザを再読み込みする（`npm run dev:lib` の watch も同じ）。
+
 ### 3. tonemap は Worker 側で決める
 
 `GpuWorkerView` は色をそのまま表示する（`toneMapping` は掛けない）。シーン側で

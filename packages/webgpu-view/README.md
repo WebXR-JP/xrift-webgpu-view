@@ -205,5 +205,8 @@ npm run build        # dist/ に ESM + d.ts
 npm run typecheck
 ```
 
+アプリ側から `dist` を参照している場合、`npm run dev`（watch）で書き換えると
+Vite の HMR が乱れて画面が真っ白になることがある。そのときはブラウザを再読み込みする。
+
 `dist` は `index.js`（メイン）/ `worker/index.js`（Worker）/ `experimental/index.js`（実験）の
 3 エントリ。`react` / `three` / `@react-three/fiber` は external。
