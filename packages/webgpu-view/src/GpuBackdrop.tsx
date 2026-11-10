@@ -237,6 +237,12 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
     }
   }, [geometry, material])
 
+  useEffect(() => {
+    // three は `xr.enabled` が true でないと、セッション中でも XR 用の描画に切り替えない。
+    // セッションの生成（Enter VR）はホスト側の仕事なので、ここでは許可だけしておく。
+    gl.xr.enabled = true
+  }, [gl])
+
   useFrame((state) => {
     const mesh = backdropRef.current
     if (!mesh) return

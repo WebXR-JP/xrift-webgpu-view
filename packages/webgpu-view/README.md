@@ -172,6 +172,22 @@ XR 中はブラウザが用意した目のカメラをそのまま使い、**左
 - 目のアスペクトが分かった時点で Worker の解像度を合わせ直す。
 
 3D の遮蔽はしない。WebGPU のシーンは常にメインシーンより奥になる。
+
+### XRift の Enter VR
+
+XRift の「Enter VR」は、ホスト側の `WebGLRenderer` に WebXR セッションを張る。
+React Three Fiber は `gl.xr` の `sessionstart` / `sessionend` を購読していて、
+セッション中は `advance()` でフレームを回す（`useFrame` も動く）。
+
+`GpuBackdrop` は毎フレーム `gl.xr.isPresenting` を見ているだけなので、
+**ワールド側の追加コードなしで自動的に切り替わる**。
+
+- Enter VR → 2 視点（目ごとの射影行列）で描画、`uPerEye` が有効になる
+- VR を終了 → 単眼に戻り、Worker の解像度も戻る
+
+ローカルの `DevEnvironment` には Enter VR が無い。VR はプラットフォームに
+アップロードして確認する（自前で試すなら `navigator.xr.requestSession()` の結果を
+`gl.xr.setSession(session)` に渡す）。
 深度を比較して合成する方式（`experimental/DepthComposite`）は WebXR では動かない。
 WebXR のフレームバッファはブラウザが所有しており、メインシーンを自分の RT に描いてから
 目ごとに合成する経路が無いため。

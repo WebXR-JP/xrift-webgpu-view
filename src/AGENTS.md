@@ -132,6 +132,18 @@ three の XR は **1 回の `render()` で両目を描く**。`projectObject` �
 - 目のアスペクト（`P[5] / P[0]`）が分かった時点で Worker の解像度を合わせ直す
   （`xrAspect` state）。
 
+### XRift の Enter VR
+
+プラットフォームの「Enter VR」がホストの `WebGLRenderer` にセッションを張る。
+r3f は `gl.xr` の `sessionstart` を購読していて、セッション中は自前の rAF ではなく
+`advance()`（＝ `useFrame` → `gl.render`）でフレームを回す。
+
+- そのため `GpuBackdrop` は `gl.xr.isPresenting` を見るだけで自動的に切り替わる。
+- ローカルの `DevEnvironment` には Enter VR が無いので、VR の確認はアップロード後。
+- `xr.isPresenting = true` を手で立てるだけでは r3f のループが止まる
+  （r3f は presenting 中、自分の rAF での描画をスキップし、セッションのループに任せる）。
+  シミュレーションするときは `sessionstart` イベントまで再現する必要がある。
+
 ### XR の制約
 
 - 背景はカメラに追従する（視差なし）。3D の遮蔽はしない。
