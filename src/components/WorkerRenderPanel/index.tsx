@@ -18,6 +18,7 @@ import {
   Texture,
   Vector3,
 } from 'three'
+import GpuWorker from '../../worker/gpuWorker.ts?worker'
 import type { FrameRequest, WorkerRequest, WorkerResponse } from '../../worker/protocol'
 
 export type PanelAnchor = 'center' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
@@ -128,11 +129,11 @@ export const WorkerRenderPanel: React.FC<WorkerRenderPanelProps> = ({
   }, [texture, geometry])
 
   // --- Worker 起動 ---------------------------------------------------------
-  // 注意: Vite はこの URL をビルド時に `base` 基準の絶対パスへ書き換える。
-  // ルート以外（CDN のサブパス等）に配信する場合は base の設定か、
-  // `xrift upload` 後に配信 URL からの相対解決が必要になる
+  // Vite の `?worker` import を使う（worker チャンクの URL はビルド時に埋め込まれる）。
+  // 注意: その URL は `base` 基準の絶対パスになるため、ルート以外（CDN のサブパス等）に
+  // 配信する場合は base の設定が必要になる
   useEffect(() => {
-    const worker = new Worker(new URL('../../worker/gpuWorker.ts', import.meta.url), { type: 'module' })
+    const worker = new GpuWorker()
     workerRef.current = worker
     readyRef.current = false
 
