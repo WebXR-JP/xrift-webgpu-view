@@ -7,14 +7,16 @@
 
 | パス | 役割 |
 | --- | --- |
-| `worker/gpuWorker.ts` | OffscreenCanvas + `WebGPURenderer`。コーネルボックスと GPU パーティクルを描画し、`ImageBitmap` を返す |
+| `worker/gpuWorker.ts` | OffscreenCanvas + `WebGPURenderer`。コーネルボックスと GPU パーティクルを描画し、色（+ 深度）の `ImageBitmap` を返す |
 | `worker/protocol.ts` | メイン / Worker 共用のメッセージ型（DOM に依存させない） |
-| `components/WorkerRenderPanel/index.tsx` | Worker 起動、カメラ行列の送信、`ImageBitmap` のテクスチャ化、カメラ追従パネルの描画 |
-| `World.tsx` | `<WorkerRenderPanel />` を右下に配置 |
+| `gpu-worker/useGpuWorker.ts` | Worker の起動 / カメラ行列の送信 / `ImageBitmap` のテクスチャ化（パネルと深度合成で共用） |
+| `components/WorkerRenderPanel/index.tsx` | カメラ追従パネルに投影（深度なしのリファレンス実装） |
+| `components/DepthComposite/index.tsx` | メインシーンと深度合成して全画面に描く |
+| `World.tsx` | `USE_DEPTH_COMPOSITE` で上の 2 つを切り替える |
 
 流れ: `useFrame` でメインカメラの `matrixWorldInverse` / `projectionMatrix` を送信 →
 Worker が同じ視点で描画 → `transferToImageBitmap()` → `postMessage(bitmap, [bitmap])` →
-メインで `Texture.image` に差し替えて板ポリに貼る。
+メインで `Texture.image` に差し替えて使う。
 
 ## 必ず守ること
 
@@ -67,10 +69,56 @@ OffscreenCanvas を transfer していないため、Worker 側からは描画�
 パネルはヘッド追従の板ポリなので、VR 中は目の前に浮く板になる。両眼で正しいステレオ合成をするには
 per-eye の描画 / 合成が必要（現状は未対応）。
 
+## 深度合成（DepthComposite）
+
+WebGL2 には `gl_FragDepth` が無いので、**深度を「書く」ことはできない**。
+代わりに「メインシーンの深度」と「Worker の深度」をピクセルごとに比べて色を選ぶ。
+
+1. メインシーンを `HalfFloatType` の `WebGLRenderTarget`（`DepthTexture` 付き）へ描く
+2. 全画面クアッドで、ピクセルごとに Worker の色かシーンの色かを選ぶ
+3. 選んだ色をメインキャンバスへ出力する
+
+そのため `useFrame(..., 1)` で R3F のレンダリングを乗っ取り、自分で `gl.render()` を呼ぶ。
+XR 中は合成できないので通常描画へフォールバックする。
+
+### 深度の受け渡し
+
+- Worker は同じ OffscreenCanvas を **2 回**描く。1 回目は可視化用の色（そのまま）、
+  2 回目は `scene.overrideMaterial` で距離を色に詰めた画像。
+- 距離は view 空間の `-z` を `DEPTH_RANGE`（50）で正規化し、**R,G に 16bit**でパックする。
+  R,G = 0 は「描画なし」の意味。8bit 1 枚では精度が足りず、等高線状の縞が出る。
+- 2 枚を `transferToImageBitmap()` して `depthBitmap` として一緒に送る。
+- メイン側は R,G を `(hi*256+lo)/65535` で戻し、`uDepthRange` を掛けて距離に戻す。
+
+### 色の扱い（ハマりどころ）
+
+- **Worker のレンダラは `toneMapping = NoToneMapping` 固定**。理由は 2 つ:
+  - `toneMapping` はレンダラ単位の設定で、切り替えると他のマテリアルのビルドにも影響する
+    （深度パスだけトーンマップを切ろうとするとカラーパスまで暗くなる）
+  - ACES は非線形なので、深度をパックした色が壊れる
+- 代わりに **ACES は `DepthComposite` の合成パスで掛ける**（`uWorkerExposure`）。
+  8bit に落としてから掛けるので、Worker 側で 1.0 を超えるハイライトはクリップする。
+- **sRGB テクスチャはサンプル時にハードウェアでリニアに戻る**（three は内部フォーマットを
+  `SRGB8_ALPHA8` にする）。合成パスで `sRGBToLinear()` を掛けると二重デコードで暗くなる。
+- シーン色（RT）はリニア + トーンマップ前なので、合成パスでレンダラと同じ
+  トーンマップ + sRGB エンコードを行う（`uToneMapping` は `renderer.toneMapping` から渡す）。
+
+### その他
+
+- Worker の部屋は `ROOM_LIFT`（6cm）だけ浮かせている。メイン世界の地面も y=0 なので、
+  そのままだと床同士が同一平面になり縞（z-fighting）が出る。
+- 深度を書かないもの（パーティクル）は深度パスから外している。そのためパーティクルは
+  「背後の面の深度」で合成され、手前の遮蔽物に正しく隠れない（仕様として許容）。
+- `DepthComposite` の `debug` prop で確認できる:
+  `1` 距離 / `2` パックした生バイト / `3` Worker の色のみ / `4` 採用マスク（緑=Worker, 赤=シーン）。
+
 ## 実装上のクセ
 
 - `ImageBitmap` は使い終わったら `close()` する。メイン側は 1 フレーム遅らせて解放している
   （アップロード前に閉じると壊れるため）。
+- `transferToImageBitmap()` は canvas の内容を消費する（呼ぶと空になる）。1 フレームで
+  色と深度の 2 枚が欲しいときは「深度を描く → transfer → 色を描く → transfer」の順にする。
+- `sRGBTransferEOTF()` で深度パス出力を事前に打ち消している（出力段で sRGB エンコードされるため）。
 - パーティクルは TSL の `instancedArray` + `Fn().compute()` で GPU 上で更新する。
   描画は `SpriteNodeMaterial` の `positionNode = positions.toAttribute()` と `THREE.Sprite` の
   `count` でインスタンス数を指定する（r183 の API）。
@@ -85,6 +133,19 @@ per-eye の描画 / 合成が必要（現状は未対応）。
   `flowX/Y/Z` の係数（流れ）、`toneMappingExposure`、ライトの強さ。
 - `WorkerRenderPanel`: `coverage` / `anchor` / `margin`（画面内の位置と大きさ）、
   `maxWidth`（解像度上限）、`maxFps`、`enabled`。
+- `DepthComposite`: `maxWidth` / `resolutionScale` / `maxFps`、`debug`。
+  Worker の露出は `uWorkerExposure`（既定 1.15）。`DEPTH_RANGE` は `worker/gpuWorker.ts` と
+  揃える必要がある。
+
+## 検証手順
+
+深度合成が壊れたときは、まず `debug` を切り替えて切り分ける。
+
+| 症状 | 見るもの |
+| --- | --- |
+| 全面がシーン / 全面が Worker | `debug={4}` のマスク |
+| 縞・ノイズ状のまだら | `debug={1}` で深度が滑らかか（粗ければパック精度かエンコード） |
+| 色が暗い / 白飛び | `debug={3}` で Worker の素の色を確認 |
 
 ## 動作確認
 

@@ -12,10 +12,11 @@
  */
 
 import {
-  ACESFilmicToneMapping,
   AmbientLight,
+  NoToneMapping,
   BoxGeometry,
   Color,
+  Group,
   Mesh,
   MeshBasicNodeMaterial,
   MeshStandardNodeMaterial,
@@ -35,7 +36,9 @@ import {
   instancedArray,
   instanceIndex,
   mix,
+  positionView,
   shapeCircle,
+  sRGBTransferEOTF,
   uniform,
   vec3,
 } from 'three/tsl'
@@ -65,6 +68,19 @@ const ROOM = {
 /** パーティクルが反射する境界（部屋の内側） */
 const PARTICLE_BOUND = ROOM.size / 2 - 0.45
 
+/**
+ * 部屋を持ち上げる量。
+ * メイン世界の地面も y=0 なので、そのままだと床同士が同一平面になり
+ * 深度合成が z-fighting する。数 cm だけ浮かせて決着させる。
+ */
+const ROOM_LIFT = 0.06
+
+/**
+ * 深度パスで 0..1 に正規化する距離の上限（ワールド単位）。
+ * 16bit（65535 段階）で表現するので 50 / 65535 ≒ 0.76mm 精度になる。
+ */
+const DEPTH_RANGE = 50
+
 // ---------------------------------------------------------------------------
 // シーン構築（メインスレッドのカメラで覗くためのコーネルボックス）
 // ---------------------------------------------------------------------------
@@ -75,17 +91,29 @@ let camera = new PerspectiveCamera(50, 1, 0.1, 1000)
 let renderer: WebGPURenderer | null = null
 let offscreen: OffscreenCanvas | null = null
 
+
 /** TSL の ComputeNode（型は renderer.compute() の引数から借りる） */
 type ComputeTask = Parameters<WebGPURenderer['compute']>[0]
 
 let computeInit: ComputeTask | null = null
 let computeUpdate: ComputeTask | null = null
+
+/** 深度パス用（距離をパックして描く）マテリアル */
+let depthMaterial: MeshBasicNodeMaterial | null = null
+/** 深度を書かないもの（パーティクル）は深度パスから外すため保持 */
+let particles: Sprite | null = null
+/** 深度画像も返すか */
+let wantDepth = false
 let uTime = uniform(0)
 let uDelta = uniform(1 / 60)
 
 function createScene() {
   scene = new Scene()
   scene.background = new Color(0x05070c)
+
+  const room = new Group()
+  room.position.y = ROOM_LIFT
+  scene.add(room)
 
   const { size: s, height: h, thickness: t } = ROOM
 
@@ -103,14 +131,13 @@ function createScene() {
   ) => {
     const mesh = new Mesh(new BoxGeometry(w, bh, d), material)
     mesh.position.set(x, y, z)
-    scene.add(mesh)
+    room.add(mesh)
     return mesh
   }
 
   // 床・天井・奥（白）
-  // 床は手前（カメラ側）まで伸ばす。メインカメラは目線の高さなので、
-  // 短い床だと視錐台の下端が床の外に出て背景が見えてしまう
-  addBox(s, t, 16, 0, -t / 2, 4, surface(0xe9e9e9))
+  // 床は部屋の範囲だけ。手前はメイン世界の地面が見える（深度合成の確認になる）
+  addBox(s, t, s, 0, -t / 2, 0, surface(0xe9e9e9))
   addBox(s, t, s, 0, h + t / 2, 0, surface(0xe9e9e9))
   addBox(s, h, t, 0, h / 2, -s / 2 - t / 2, surface(0xe9e9e9))
   // 左（赤）/ 右（緑）
@@ -121,12 +148,12 @@ function createScene() {
   const cube = new Mesh(new BoxGeometry(1.7, 1.7, 1.7), surface(0xdcdcdc))
   cube.position.set(-1.05, 0.85, 0.55)
   cube.rotation.y = 0.32
-  scene.add(cube)
+  room.add(cube)
 
   const tall = new Mesh(new BoxGeometry(1.3, 2.8, 1.3), surface(0xcccccc))
   tall.position.set(1.1, 1.4, -0.55)
   tall.rotation.y = -0.38
-  scene.add(tall)
+  room.add(tall)
 
   // 天井の照明パネル（発光）
   const panelMaterial = new MeshBasicNodeMaterial()
@@ -134,17 +161,17 @@ function createScene() {
   const panel = new Mesh(new PlaneGeometry(2.4, 2.4), panelMaterial)
   panel.rotation.x = Math.PI / 2 // 法線を下向きに
   panel.position.set(0, h - 0.02, 0)
-  scene.add(panel)
+  room.add(panel)
 
   scene.add(new AmbientLight(0xffffff, 0.18))
   const light = new PointLight(0xfff1de, 68, 0, 2)
   light.position.set(0, h - 0.6, 0)
-  scene.add(light)
+  room.add(light)
 
   // 手前（開いている面）からの弱いフィル。ブロックの正面を沈ませないため
   const fill = new PointLight(0xfff4e6, 14, 0, 2)
   fill.position.set(0, 3.2, 4.4)
-  scene.add(fill)
+  room.add(fill)
 
   // ---------------------------------------------------------------
   // GPU パーティクル（ストレージバッファ + コンピュートシェーダ）
@@ -220,10 +247,23 @@ function createScene() {
   particleMaterial.transparent = true
   particleMaterial.depthWrite = false
 
-  const particles = new Sprite(particleMaterial)
+  particles = new Sprite(particleMaterial)
   particles.count = PARTICLE_COUNT
   particles.frustumCulled = false
-  scene.add(particles)
+  room.add(particles)
+
+  // --- 深度パス用マテリアル -------------------------------------------------
+  // 視点からの距離（view 空間の -z）を DEPTH_RANGE で正規化し、R,G に 16bit で
+  // パックする。R,G = 0 は「描画なし」を表す。
+  // 出力段で sRGB エンコードされるため、事前に EOTF で打ち消してバイト値を保つ。
+  depthMaterial = new MeshBasicNodeMaterial()
+  depthMaterial.toneMapped = false
+
+  const normalizedDepth = clamp(positionView.z.negate().div(DEPTH_RANGE), 0, 0.9999)
+  const scaledDepth = normalizedDepth.mul(65535).floor()
+  const depthHi = scaledDepth.div(256).floor()
+  const depthLo = scaledDepth.sub(depthHi.mul(256))
+  depthMaterial.colorNode = vec3(sRGBTransferEOTF(vec3(depthHi.div(255), depthLo.div(255), 0)))
 }
 
 // ---------------------------------------------------------------------------
@@ -246,8 +286,12 @@ async function initRenderer(width: number, height: number) {
   })
   renderer.setPixelRatio(1)
   renderer.setSize(width, height, false)
-  renderer.toneMapping = ACESFilmicToneMapping
-  renderer.toneMappingExposure = 1.15
+  // トーンマップは有効にしない。
+  // - レンダラ単位の設定で、切り替えると他マテリアルのビルドにも影響する
+  // - ACES は非線形なので、深度をパックした色が壊れる
+  // 色の ACES はメインスレッド側の合成パス（DepthComposite）でまとめて掛ける。
+  // （露出はメインスレッドの DepthComposite 側の uWorkerExposure で掛ける）
+  renderer.toneMapping = NoToneMapping
 
   await renderer.init()
 
@@ -303,6 +347,32 @@ async function snapshot(canvas: OffscreenCanvas) {
   }
 }
 
+/**
+ * 距離をパックした深度画像を描くパス。
+ * マテリアルを差し替えて同じシーンを描くだけ（ジオメトリは 1 回増える）。
+ * パーティクルは深度を書かないものとして外す。
+ */
+async function renderDepthPass() {
+  if (!renderer || !offscreen || !depthMaterial) return null
+
+  const previousBackground = scene.background
+  const previousOverride = scene.overrideMaterial
+  const previousParticles = particles?.visible ?? false
+
+  scene.background = null // 背景色が深度として書かれないようにする（クリアは黒）
+  scene.overrideMaterial = depthMaterial
+  if (particles) particles.visible = false
+
+  renderer.render(scene, camera)
+  const bitmap = await snapshot(offscreen)
+
+  scene.background = previousBackground
+  scene.overrideMaterial = previousOverride
+  if (particles) particles.visible = previousParticles
+
+  return bitmap
+}
+
 async function renderFrame(frame: FrameRequest) {
   if (!renderer || !offscreen) return
 
@@ -313,8 +383,13 @@ async function renderFrame(frame: FrameRequest) {
   uDelta.value = frame.delta
 
   renderer.compute(computeUpdate!)
-  renderer.render(scene, camera)
 
+  let depthBitmap: ImageBitmap | null = null
+  if (wantDepth) {
+    depthBitmap = await renderDepthPass()
+  }
+
+  renderer.render(scene, camera)
   const bitmap = await snapshot(offscreen)
 
   scope.postMessage(
@@ -322,11 +397,12 @@ async function renderFrame(frame: FrameRequest) {
       type: 'result',
       id: frame.id,
       bitmap,
+      depthBitmap: depthBitmap ?? undefined,
       width: size.width,
       height: size.height,
       renderMs: performance.now() - started,
     },
-    [bitmap],
+    depthBitmap ? [bitmap, depthBitmap] : [bitmap],
   )
 }
 
@@ -353,6 +429,7 @@ scope.onmessage = async (event) => {
 
   if (message.type === 'init') {
     size = { width: message.width, height: message.height }
+    wantDepth = message.depth === true
 
     if (initialized) return
 

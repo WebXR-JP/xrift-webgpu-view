@@ -11,6 +11,11 @@ export interface InitRequest {
   type: 'init'
   width: number
   height: number
+  /**
+   * 深度画像（距離を R,G の 16bit でパックした RGBA8）も返すか。
+   * 深度合成を使うときだけ有効にする（毎フレーム 2 回描画 + 転送になる）
+   */
+  depth?: boolean
 }
 
 export interface ResizeRequest {
@@ -64,6 +69,8 @@ export interface FrameResponse {
   type: 'result'
   id: number
   bitmap: ImageBitmap
+  /** depth: true のときだけ。R,G に 16bit 距離がパックされている */
+  depthBitmap?: ImageBitmap
   width: number
   height: number
   /** Worker 側で 1 フレーム描画に要した時間（ms） */

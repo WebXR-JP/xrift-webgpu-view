@@ -2,9 +2,16 @@ import { SpawnPoint } from '@xrift/world-components'
 import { RigidBody } from '@react-three/rapier'
 import { useRef } from 'react'
 import { Mesh } from 'three'
+import { DepthComposite } from './components/DepthComposite'
 import { Skybox } from './components/Skybox'
 import { WorkerRenderPanel } from './components/WorkerRenderPanel'
 import { COLORS, WORLD_CONFIG } from './constants'
+
+/**
+ * true  = メインシーンと深度合成して全画面に描く（DepthComposite）
+ * false = 画面隅のパネルに投影する（WorkerRenderPanel / 深度なし）
+ */
+const USE_DEPTH_COMPOSITE = true
 
 export interface WorldProps {
   position?: [number, number, number]
@@ -68,6 +75,12 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
           </mesh>
         </RigidBody>
 
+        {/* ========== 深度合成の確認用オクルーダー（不要なら削除） ========== */}
+        <mesh position={[0, 1.5, 4.2]} rotation={[0.3, 0.5, 0]} castShadow>
+          <torusKnotGeometry args={[0.5, 0.18, 128, 16]} />
+          <meshStandardMaterial color="#f2c14e" roughness={0.35} metalness={0.2} />
+        </mesh>
+
         {/* ========== スポーン ========== */}
         <group position={[0, 0, 8]}>
           <SpawnPoint />
@@ -75,8 +88,11 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
       </group>
 
       {/* ========== Worker + WebGPU の描画結果 ========== */}
-      {/* メインカメラの行列を Worker に渡し、ImageBitmap をテクスチャとしてメインキャンバスに投影する */}
-      <WorkerRenderPanel coverage={0.55} anchor="bottom-right" />
+      {USE_DEPTH_COMPOSITE ? (
+        <DepthComposite />
+      ) : (
+        <WorkerRenderPanel coverage={0.55} anchor="bottom-right" />
+      )}
     </>
   )
 }
