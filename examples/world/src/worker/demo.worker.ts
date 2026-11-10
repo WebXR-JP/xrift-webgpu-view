@@ -1,4 +1,4 @@
-import { defineGpuWorker } from '@xrift/webgpu-view/worker'
+import { defineGpuWorker } from '@webxr-jp/webgpu-view/worker'
 import { createDemoScene } from './demoScene'
 
 /**

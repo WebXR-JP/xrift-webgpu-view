@@ -1,5 +1,5 @@
 {
-  "name": "@xrift/webgpu-view",
+  "name": "@webxr-jp/webgpu-view",
   "version": "0.1.0",
   "description": "Run a WebGPU scene in a Worker and show it in a React Three Fiber canvas (monitor and XR).",
   "type": "module",
@@ -50,10 +50,10 @@
     "dev": "vite build --watch",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && npm run build",
-    "example:dev": "npm run dev -w @xrift/webgpu-view-example",
-    "example:build": "npm run build -w @xrift/webgpu-view-example",
-    "example:typecheck": "npm run typecheck -w @xrift/webgpu-view-example",
-    "example:upload": "npm run upload -w @xrift/webgpu-view-example",
+    "example:dev": "npm run dev -w @webxr-jp/webgpu-view-example",
+    "example:build": "npm run build -w @webxr-jp/webgpu-view-example",
+    "example:typecheck": "npm run typecheck -w @webxr-jp/webgpu-view-example",
+    "example:upload": "npm run upload -w @webxr-jp/webgpu-view-example",
     "check": "npm run typecheck && npm run build && npm run example:typecheck && npm run example:build"
   },
   "peerDependencies": {

@@ -1,4 +1,4 @@
-# @xrift/webgpu-view
+# @webxr-jp/webgpu-view
 
 Worker の中で WebGPU（three.js の `WebGPURenderer`）で描いたシーンを `ImageBitmap` として受け取り、
 React Three Fiber のキャンバスの **全画面の背景** として出すためのライブラリ。
@@ -11,7 +11,7 @@ Skybox の置き換えを想定している。
 - **通常（モニタ）**: 画面全体を覆う板ポリをシーンより先に描く
 - **XR**: 左右の目ぶんを 1 フレームで描き（アトラス）、目ごとのビューポートいっぱいに出す
 - **深度は書かない**: メインシーンのオブジェクトは常に手前（背景より奥には何も描かれない）
-- 深度を比較して合成する実験は `@xrift/webgpu-view/experimental` に分けてある（XR 非対応）
+- 深度を比較して合成する実験は `@webxr-jp/webgpu-view/experimental` に分けてある（XR 非対応）
 
 ```
 メインスレッド                        Worker
@@ -28,7 +28,7 @@ Skybox の置き換えを想定している。
 ## インストール
 
 ```bash
-npm install @xrift/webgpu-view
+npm install @webxr-jp/webgpu-view
 ```
 
 peer: `react` >= 19 / `three` >= 0.183 / `@react-three/fiber` >= 9
@@ -49,7 +49,7 @@ import {
   MeshStandardNodeMaterial,
   Scene,
 } from 'three/webgpu'
-import { defineGpuWorker } from '@xrift/webgpu-view/worker'
+import { defineGpuWorker } from '@webxr-jp/webgpu-view/worker'
 
 defineGpuWorker(({ renderer }) => {
   const scene = new Scene()
@@ -75,7 +75,7 @@ defineGpuWorker(({ renderer }) => {
 ### 2. コンポーネントを置く
 
 ```tsx
-import { GpuBackdrop } from '@xrift/webgpu-view'
+import { GpuBackdrop } from '@webxr-jp/webgpu-view'
 import MyWorker from './my.worker.ts?worker'
 
 export const World = () => (
@@ -195,10 +195,10 @@ React Three Fiber は `gl.xr` の `sessionstart` / `sessionend` を購読して�
 WebXR のフレームバッファはブラウザが所有しており、メインシーンを自分の RT に描いてから
 目ごとに合成する経路が無いため。
 
-## 実験機能（`@xrift/webgpu-view/experimental`）
+## 実験機能（`@webxr-jp/webgpu-view/experimental`）
 
 ```tsx
-import { DepthComposite } from '@xrift/webgpu-view/experimental'
+import { DepthComposite } from '@webxr-jp/webgpu-view/experimental'
 
 <DepthComposite worker={MyWorker} stereo={false} debug={0} />
 ```
@@ -240,12 +240,12 @@ webgpu-test/
 │   ├── worker/           # defineGpuWorker（Worker ランタイム）
 │   └── experimental/     # DepthComposite（深度合成・実験）
 ├── vite.config.ts        # ライブラリビルド（3 エントリ）
-├── package.json          # @xrift/webgpu-view（workspaces: examples/*）
+├── package.json          # @webxr-jp/webgpu-view（workspaces: examples/*）
 └── examples/
     └── world/            # テスト用の XRift ワールド
         ├── src/          # World.tsx / worker/demo.worker.ts / demoScene.ts
         ├── xrift.json
-        └── package.json  # @xrift/webgpu-view-example（private）
+        └── package.json  # @webxr-jp/webgpu-view-example（private）
 ```
 
 ## 開発
@@ -265,7 +265,7 @@ npm run example:upload   # XRift にアップロード（要 xrift login）
 npm run check            # 本体 + ワールドの型チェックとビルド
 ```
 
-`examples/world` は `@xrift/webgpu-view` を `file:../..` で参照している（npm workspaces）。
+`examples/world` は `@webxr-jp/webgpu-view` を `file:../..` で参照している（npm workspaces）。
 `examples/world` 内で `npm run dev` しても、`predev` がリポジトリ直下のライブラリをビルドする。
 
 アプリ側から `dist` を参照している場合、`npm run dev`（watch）で書き換えると

@@ -1,4 +1,4 @@
-# AGENTS.md — @xrift/webgpu-view
+# AGENTS.md — @webxr-jp/webgpu-view
 
 Worker の中で WebGPU（three.js の `WebGPURenderer`）で描いたシーンを `ImageBitmap` として受け取り、
 React Three Fiber のキャンバスの **全画面の背景** として出すライブラリ。
@@ -17,15 +17,15 @@ React Three Fiber のキャンバスの **全画面の背景** として出す�
 │   ├── worker/           #   Worker 入口（defineGpuWorker）
 │   └── experimental/     #   DepthComposite（深度合成・実験）
 ├── vite.config.ts        # ライブラリビルド（3 エントリ / ESM + d.ts）
-├── package.json          # @xrift/webgpu-view（workspaces: examples/*）
-└── examples/world/       # テスト用ワールド（@xrift/webgpu-view-example / private）
+├── package.json          # @webxr-jp/webgpu-view（workspaces: examples/*）
+└── examples/world/       # テスト用ワールド（@webxr-jp/webgpu-view-example / private）
 ```
 
 | エントリ | 中身 |
 | --- | --- |
-| `@xrift/webgpu-view` | `GpuBackdrop` / `useGpuWorker` / 通信型 |
-| `@xrift/webgpu-view/worker` | `defineGpuWorker` と型（React を巻き込まない） |
-| `@xrift/webgpu-view/experimental` | `DepthComposite`（安定 API ではない） |
+| `@webxr-jp/webgpu-view` | `GpuBackdrop` / `useGpuWorker` / 通信型 |
+| `@webxr-jp/webgpu-view/worker` | `defineGpuWorker` と型（React を巻き込まない） |
+| `@webxr-jp/webgpu-view/experimental` | `DepthComposite`（安定 API ではない） |
 
 ## コマンド
 
@@ -42,7 +42,7 @@ npm run example:upload  # XRift にアップロード（要 xrift login）
 npm run check           # 本体 + ワールドの型チェックとビルド
 ```
 
-`examples/world` は `@xrift/webgpu-view` を `file:../..` で参照している。
+`examples/world` は `@webxr-jp/webgpu-view` を `file:../..` で参照している。
 `examples/world` 内で `npm run dev` しても `predev` がリポジトリ直下のライブラリをビルドする。
 
 ## 必ず守ること

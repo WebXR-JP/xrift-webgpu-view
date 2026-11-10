@@ -1,8 +1,8 @@
 {
-  "name": "@xrift/webgpu-view-example",
+  "name": "@webxr-jp/webgpu-view-example",
   "private": true,
   "version": "0.1.0",
-  "description": "XRift world used to test @xrift/webgpu-view on monitor and in VR",
+  "description": "XRift world used to test @webxr-jp/webgpu-view on monitor and in VR",
   "type": "module",
   "main": "./dist/remoteEntry.js",
   "module": "./dist/remoteEntry.js",
@@ -57,7 +57,7 @@
     "vite-plugin-dts": "^4.0.0"
   },
   "dependencies": {
-    "@xrift/webgpu-view": "file:../..",
+    "@webxr-jp/webgpu-view": "file:../..",
     "@xrift/world-components": "^0.63.0"
   }
 }

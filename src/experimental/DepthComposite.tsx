@@ -1,7 +1,7 @@
 /**
  * メインシーンの深度と Worker の深度を比較して、全画面に合成する（実験的）
  *
- * これはライブラリの安定 API ではない。`@xrift/webgpu-view/experimental` からの
+ * これはライブラリの安定 API ではない。`@webxr-jp/webgpu-view/experimental` からの
  * 直接 import でだけ使える。通常は `GpuBackdrop` を使うこと。
  *
  * 仕組み:

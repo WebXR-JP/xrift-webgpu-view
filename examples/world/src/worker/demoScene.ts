@@ -33,7 +33,7 @@ import {
   uniform,
   vec3,
 } from 'three/tsl'
-import type { GpuWorkerInit, GpuWorkerScene } from '@xrift/webgpu-view/worker'
+import type { GpuWorkerInit, GpuWorkerScene } from '@webxr-jp/webgpu-view/worker'
 
 const PARTICLE_COUNT = 40_000
 

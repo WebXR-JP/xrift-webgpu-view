@@ -53,7 +53,7 @@ import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 
 ## プロジェクト概要
 
-このディレクトリは **`@xrift/webgpu-view` の動作確認用ワールド**（テスト用）。
+このディレクトリは **`@webxr-jp/webgpu-view` の動作確認用ワールド**（テスト用）。
 ライブラリ本体はリポジトリ直下（`../../src`）にあり、ここはパッケージには含めない。
 
 - **用途**: ライブラリの動作確認（モニタ / XR）と XRift へのアップロード検証
@@ -66,9 +66,9 @@ import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 
 ```
 xrift-webgpu-view/            # リポジトリ = npm パッケージ
-├── src/                      # ★ ライブラリ本体（@xrift/webgpu-view）
+├── src/                      # ★ ライブラリ本体（@webxr-jp/webgpu-view）
 ├── vite.config.ts            # ライブラリビルド（3 エントリ）
-├── package.json              # @xrift/webgpu-view
+├── package.json              # @webxr-jp/webgpu-view
 └── examples/
     └── world/                # ★ このディレクトリ（テスト用ワールド）
         ├── public/           # アセットファイル（直接配置、サブディレクトリ不要）
@@ -82,7 +82,7 @@ xrift-webgpu-view/            # リポジトリ = npm パッケージ
         ├── .triplex/         # Triplex（3Dエディタ）設定
         ├── xrift.json        # XRift CLI設定
         ├── vite.config.ts    # ビルド設定（Module Federation）
-        └── package.json      # @xrift/webgpu-view-example（private）
+        └── package.json      # @webxr-jp/webgpu-view-example（private）
 ```
 
 ---

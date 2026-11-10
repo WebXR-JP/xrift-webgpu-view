@@ -1,7 +1,7 @@
 # src/AGENTS.md — WebGPU Worker ビューの実装メモ
 
 このワールドは「Worker で WebGPU 描画した結果を、メインの Three.js（WebGL）キャンバスの
-背景として出す」デモ。仕組みはリポジトリ直下の `src/`（`@xrift/webgpu-view`）にある。
+背景として出す」デモ。仕組みはリポジトリ直下の `src/`（`@webxr-jp/webgpu-view`）にある。
 このディレクトリ（`examples/world`）はライブラリの動作確認用で、パッケージ本体ではない。
 
 ## ファイル構成
@@ -41,7 +41,7 @@ import DemoWorker from './worker/demo.worker.ts?worker'
 
 ### 2. ライブラリの変更はビルドしてから使う
 
-`@xrift/webgpu-view` は `dist` を参照している（`file:../..` の npm workspaces）。
+`@webxr-jp/webgpu-view` は `dist` を参照している（`file:../..` の npm workspaces）。
 ライブラリ本体（リポジトリ直下の `src/`）を編集したら
 
 ```bash
