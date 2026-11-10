@@ -1,12 +1,17 @@
 /**
- * Worker の WebGPU 描画を、カメラに追従するスクリーンとしてメインキャンバスに出す。
+ * Worker の WebGPU 描画を、メインキャンバスの「背景」として全画面に出す。
  *
- * - 通常（モニタ）: カメラの視錐台に合わせた板ポリ 1 枚に貼る。
- *   `coverage` を 1 にすると画面いっぱい、小さくするとパネルになる。
- * - XR: ヘッドの少し前に板ポリを置き、シェーダが「どちらの目から描いているか」を
- *   見てアトラスの左右を選ぶ。3D の遮蔽はしないが、両眼で正しいステレオになる。
+ * Skybox の置き換えを想定している。
+ * - 画面全体を覆うスクリーン空間の板ポリを、シーンより先に描く
+ *   （`renderOrder` を下げ、深度テスト・深度書き込みを無効にする）
+ * - メインシーンのオブジェクトは通常どおりその上に描かれる
+ * - カメラに追従するので、背景として視差は出ない
  *
- * 深度合成はしない（experimental/DepthComposite を参照）。
+ * XR では three が 1 回の `render()` で両目を描く。板ポリは目ごとのビューポートを
+ * そのまま覆い、シェーダが「どちらの目から描いているか」を見てアトラスの左右を選ぶ。
+ *
+ * 深度は書かないので、メインシーンとの前後関係は「常に奥」になる。
+ * メインシーンとピクセル単位で合成したい場合は `experimental/DepthComposite` を使う。
  */
 
 import { useFrame, useThree } from '@react-three/fiber'
@@ -18,22 +23,25 @@ import {
   Mesh,
   PerspectiveCamera,
   PlaneGeometry,
-  Quaternion,
   ShaderMaterial,
   Vector3,
 } from 'three'
-import type { Matrix4 } from 'three'
-import { getFrustumRect } from './frustum'
-import type { ViewAnchor } from './frustum'
 import { useGpuWorker } from './useGpuWorker'
 import type { GpuWorkerReadyInfo, WorkerConstructor } from './useGpuWorker'
 
+/** シーンより先に描くための renderOrder（背景） */
+const BACKDROP_RENDER_ORDER = -1000
+
+/**
+ * 画面全体を覆う板ポリ。射影を通さず NDC に直接置くので、
+ * カメラの画角・XR の非対称フラスタムに関係なくビューポートいっぱいになる。
+ */
 const vertexShader = /* glsl */ `
 varying vec2 vUv;
 
 void main() {
   vUv = uv;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  gl_Position = vec4(position.xy, 0.0, 1.0);
 }
 `
 
@@ -80,18 +88,11 @@ void main() {
 }
 `
 
-export interface GpuWorkerViewProps {
+export interface GpuBackdropProps {
   /** `import MyWorker from './my.worker.ts?worker'` の既定エクスポート */
   worker: WorkerConstructor
   /** Worker の起動時に 1 回だけ渡す任意のデータ */
   workerData?: unknown
-  /** 画面に対する大きさ（1 = 視錐台いっぱい、0.6 = 画面の 60%） */
-  coverage?: number
-  anchor?: ViewAnchor
-  /** 画面端からの余白（NDC 単位。1 で画面の半分） */
-  margin?: number
-  /** カメラからの距離（m）。大きさは coverage で決まるので通常は触らない */
-  distance?: number
   /** Worker の描画解像度の上限（1 視点ぶんの横幅 px） */
   maxWidth?: number
   /** 解像度スケール（devicePixelRatio に掛ける） */
@@ -106,28 +107,21 @@ export interface GpuWorkerViewProps {
   stereo?: boolean
   /** SBS の眼間距離（m） */
   eyeSeparation?: number
-  /** シーンの手前の物で隠す（既定 false = 常に手前） */
-  depthTest?: boolean
   onReady?: (info: GpuWorkerReadyInfo) => void
   onError?: (message: string) => void
   /** コンソールに ready / fps を出す */
   debug?: boolean
 }
 
-export const GpuWorkerView: React.FC<GpuWorkerViewProps> = ({
+export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
   worker,
   workerData,
-  coverage = 0.6,
-  anchor = 'center',
-  margin = 0.03,
-  distance = 1,
   maxWidth = 1280,
   resolutionScale = 1,
   maxFps = 60,
   enabled = true,
   stereo = false,
   eyeSeparation = 0.064,
-  depthTest = false,
   onReady,
   onError,
   debug = false,
@@ -136,7 +130,7 @@ export const GpuWorkerView: React.FC<GpuWorkerViewProps> = ({
   const size = useThree((state) => state.size)
   const dpr = useThree((state) => state.viewport.dpr)
 
-  /** XR 中のアスペクト（XR に入るまで null） */
+  /** XR 中の 1 視点ぶんのアスペクト（XR に入るまで null） */
   const [xrAspect, setXrAspect] = useState<number | null>(null)
 
   const eyeCount = xrAspect !== null ? 2 : stereo ? 2 : 1
@@ -160,34 +154,19 @@ export const GpuWorkerView: React.FC<GpuWorkerViewProps> = ({
 
   const getViewCameras = useCallback(
     (state: RootState): PerspectiveCamera[] => {
-      // XR 中はブラウザが用意した目のカメラを使う。
-      // 描画は「目の位置 + 左右共通の射影行列（union）」にそろえる。
-      // こうすると各目の画像を同じ板ポリに貼れて、視差は目の位置だけで付く。
+      // XR 中はブラウザが用意した目のカメラをそのまま使う。
+      // 画像は目ごとのビューポートいっぱいに貼るので、射影行列も目のものを使う。
       const xrCamera = gl.xr.isPresenting ? (gl.xr.getCamera() as ArrayCamera) : null
       if (xrCamera && xrCamera.cameras.length >= 2) {
         const eyes = xrCamera.cameras as PerspectiveCamera[]
-        const projection = xrCamera.projectionMatrix
 
-        eyeCameras.forEach((eye, index) => {
-          const source = eyes[index]
-          eye.position.copy(source.position)
-          eye.quaternion.copy(source.quaternion)
-          eye.scale.copy(source.scale)
-          eye.projectionMatrix.copy(projection)
-          eye.projectionMatrixInverse.copy(projection).invert()
-          eye.near = source.near
-          eye.far = source.far
-          eye.fov = source.fov
-          eye.aspect = source.aspect
-          eye.updateMatrixWorld()
-        })
-
+        // 目を判定するための基準点（両目の中間）
         headPosition
           .setFromMatrixPosition(eyes[0].matrixWorld)
           .add(tmpVector.setFromMatrixPosition(eyes[1].matrixWorld))
           .multiplyScalar(0.5)
 
-        return eyeCameras
+        return eyes
       }
 
       const main = state.camera as PerspectiveCamera
@@ -228,9 +207,9 @@ export const GpuWorkerView: React.FC<GpuWorkerViewProps> = ({
     debug,
   })
 
-  // --- スクリーン -----------------------------------------------------------
-  const screenRef = useRef<Mesh>(null)
-  const geometry = useMemo(() => new PlaneGeometry(1, 1), [])
+  // --- 背景の板ポリ ---------------------------------------------------------
+  const backdropRef = useRef<Mesh>(null)
+  const geometry = useMemo(() => new PlaneGeometry(2, 2), [])
 
   const material = useMemo(
     () =>
@@ -243,12 +222,12 @@ export const GpuWorkerView: React.FC<GpuWorkerViewProps> = ({
         },
         vertexShader,
         fragmentShader,
-        depthTest,
+        depthTest: false,
         depthWrite: false,
         side: DoubleSide,
         toneMapped: false,
       }),
-    [depthTest],
+    [],
   )
 
   useEffect(() => {
@@ -258,65 +237,40 @@ export const GpuWorkerView: React.FC<GpuWorkerViewProps> = ({
     }
   }, [geometry, material])
 
-  const screenPosition = useMemo(() => new Vector3(), [])
-  const screenQuaternion = useMemo(() => new Quaternion(), [])
-  const sourcePosition = useMemo(() => new Vector3(), [])
-
   useFrame((state) => {
-    const mesh = screenRef.current
+    const mesh = backdropRef.current
     if (!mesh) return
 
     const visible = enabled && hasFrame
     mesh.visible = visible
+    if (!visible) return
 
+    // 視点を更新（headPosition もここで更新される）
+    const cameras = getViewCameras(state)
     const presenting = gl.xr.isPresenting
-    const xrCamera = presenting ? (gl.xr.getCamera() as ArrayCamera) : null
-    const xrEyes = xrCamera && xrCamera.cameras.length >= 2 ? xrCamera : null
 
-    // XR に入ったら、実際の目のアスペクトで Worker の解像度を合わせ直す
-    if (xrEyes) {
-      const projection = xrEyes.projectionMatrix.elements
+    // XR に入ったら、目のアスペクトで Worker の解像度を合わせ直す
+    if (presenting && cameras.length >= 2) {
+      const projection = cameras[0].projectionMatrix.elements
       const aspect = projection[5] / projection[0]
       if (xrAspect === null || Math.abs(aspect - xrAspect) > 0.01) setXrAspect(aspect)
     } else if (xrAspect !== null) {
       setXrAspect(null)
     }
 
-    if (!visible) return
-
-    // 視点を更新（headPosition もここで更新される）
-    const cameras = getViewCameras(state)
-
-    let projection: Matrix4
-    let position: Vector3
-    let quaternion: Quaternion
-
-    if (xrEyes) {
-      // スクリーンは両目の中間に置く（視差は目の位置から自然に付く）
-      projection = xrEyes.projectionMatrix
-      position = headPosition
-      quaternion = screenQuaternion.setFromRotationMatrix(xrEyes.matrixWorld)
-    } else {
-      const camera = cameras[0] ?? (state.camera as PerspectiveCamera)
-      camera.updateMatrixWorld()
-      projection = camera.projectionMatrix
-      position = sourcePosition.setFromMatrixPosition(camera.matrixWorld)
-      quaternion = screenQuaternion.setFromRotationMatrix(camera.matrixWorld)
-    }
-
-    const rect = getFrustumRect(projection, { distance, coverage, anchor, margin })
-    screenPosition.set(rect.x, rect.y, -distance).applyQuaternion(quaternion).add(position)
-
-    mesh.position.copy(screenPosition)
-    mesh.quaternion.copy(quaternion)
-    mesh.scale.set(rect.width, rect.height, 1)
-
-    const viewCount = cameras.length
     material.uniforms.uColor.value = colorTexture
-    material.uniforms.uEyeCount.value = viewCount
-    material.uniforms.uPerEye.value = xrEyes && viewCount >= 2 ? 1 : 0
+    material.uniforms.uEyeCount.value = cameras.length
+    material.uniforms.uPerEye.value = presenting && cameras.length >= 2 ? 1 : 0
     ;(material.uniforms.uHeadPosition.value as Vector3).copy(headPosition)
   })
 
-  return <mesh ref={screenRef} geometry={geometry} material={material} frustumCulled={false} renderOrder={1000} />
+  return (
+    <mesh
+      ref={backdropRef}
+      geometry={geometry}
+      material={material}
+      frustumCulled={false}
+      renderOrder={BACKDROP_RENDER_ORDER}
+    />
+  )
 }

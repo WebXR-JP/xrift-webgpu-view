@@ -2,17 +2,17 @@ import { SpawnPoint } from '@xrift/world-components'
 import { RigidBody } from '@react-three/rapier'
 import { useRef } from 'react'
 import { Mesh } from 'three'
-import { GpuWorkerView } from '@xrift/webgpu-view'
+import { GpuBackdrop } from '@xrift/webgpu-view'
 import { DepthComposite } from '@xrift/webgpu-view/experimental'
 import { Skybox } from './components/Skybox'
 import { COLORS, WORLD_CONFIG } from './constants'
 import DemoWorker from './worker/demo.worker.ts?worker'
 
 /**
+ * false = 全画面の背景として出す（通常 / XR。深度は書かない = 常に奥）
  * true  = メインシーンの深度と合成する（experimental / XR 非対応）
- * false = カメラ追従のスクリーンに出す（通常。XR は両眼ステレオ）
  */
-const USE_DEPTH_COMPOSITE = false
+const USE_COMPOSITE = false
 
 /** モニタでも左右 2 視点で描く（SBS）。XR 中は自動で 2 視点 */
 const STEREO = false
@@ -32,7 +32,8 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
     <>
       <group position={position} scale={scale}>
         {/* ========== 環境・照明 ========== */}
-        <Skybox radius={500} />
+        {/* WebGPU の背景より先に描いておく（WebGPU が使えない環境ではこれが見える） */}
+        <Skybox radius={500} renderOrder={-2000} />
         <ambientLight intensity={0.3} />
         <directionalLight
           position={[5, 10, 5]}
@@ -92,10 +93,10 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
       </group>
 
       {/* ========== Worker + WebGPU の描画結果 ========== */}
-      {USE_DEPTH_COMPOSITE ? (
+      {USE_COMPOSITE ? (
         <DepthComposite worker={DemoWorker} workerData={{ toneMapping: false }} stereo={STEREO} />
       ) : (
-        <GpuWorkerView worker={DemoWorker} workerData={{ toneMapping: true }} coverage={0.6} anchor="bottom-right" />
+        <GpuBackdrop worker={DemoWorker} workerData={{ toneMapping: true }} stereo={STEREO} />
       )}
     </>
   )

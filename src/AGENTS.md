@@ -1,7 +1,7 @@
 # src/AGENTS.md — WebGPU Worker ビューの実装メモ
 
-このワールドは「Worker で WebGPU 描画した結果を、メインの Three.js（WebGL）キャンバスに出す」
-デモ。仕組みは `packages/webgpu-view`（`@xrift/webgpu-view`）に切り出してある。
+このワールドは「Worker で WebGPU 描画した結果を、メインの Three.js（WebGL）キャンバスの
+背景として出す」デモ。仕組みは `packages/webgpu-view`（`@xrift/webgpu-view`）に切り出してある。
 
 ## ファイル構成
 
@@ -10,11 +10,11 @@
 | `packages/webgpu-view/src/worker/defineGpuWorker.ts` | Worker 側ランタイム（レンダラ生成 / カメラ反映 / アトラス描画 / 転送） |
 | `packages/webgpu-view/src/worker/types.ts` | シーン側の型（`GpuWorkerScene` / `GpuWorkerInit`） |
 | `packages/webgpu-view/src/useGpuWorker.ts` | Worker 起動・行列送信・`ImageBitmap` → `Texture` |
-| `packages/webgpu-view/src/GpuWorkerView.tsx` | カメラ追従の板ポリ（通常 / SBS / XR） |
+| `packages/webgpu-view/src/GpuBackdrop.tsx` | 全画面の背景（NDC の板ポリ。通常 / SBS / XR） |
 | `packages/webgpu-view/src/experimental/DepthComposite.tsx` | 深度合成（実験・XR 非対応） |
 | `src/worker/demoScene.ts` | デモのコーネルボックス + GPU パーティクル |
 | `src/worker/demo.worker.ts` | `defineGpuWorker` を呼ぶだけの Worker エントリ |
-| `src/World.tsx` | `USE_DEPTH_COMPOSITE` / `STEREO` で切り替え |
+| `src/World.tsx` | `USE_COMPOSITE` / `STEREO` で切り替え |
 
 流れ: `useFrame` で視点カメラの `matrixWorldInverse` / `projectionMatrix` を送信 →
 Worker が同じ視点で描画 → `transferToImageBitmap()` → `postMessage(bitmap, [bitmap])` →
@@ -50,7 +50,7 @@ npm run build:lib   # npm run build -w @xrift/webgpu-view
 
 ### 3. tonemap は Worker 側で決める
 
-`GpuWorkerView` は色をそのまま表示する（`toneMapping` は掛けない）。シーン側で
+`GpuBackdrop` は色をそのまま表示する（`toneMapping` は掛けない）。シーン側で
 `renderer.toneMapping = ACESFilmicToneMapping` などを設定する。
 
 `experimental/DepthComposite` だけは例外で、Worker は `NoToneMapping` にして
@@ -86,9 +86,22 @@ OffscreenCanvas を transfer していないため、Worker 側からは描画�
 まるごとインライン化される（約 2.2MB）。メインの `three`（WebGL）とは別インスタンスになるため、
 シーンやジオメトリを共有することはできない。値・行列の受け渡しは `protocol.ts` 経由で行う。
 
+## 背景として描く
+
+`GpuBackdrop` は **スクリーン空間（NDC）の板ポリ** をシーンに置く。
+
+- 頂点シェーダが `gl_Position = vec4(position.xy, 0, 1)` で射影を通さない。
+  カメラの画角にも XR の非対称フラスタムにも依存せず、ビューポートをそのまま覆う。
+- `renderOrder = -1000` / `depthTest = false` / `depthWrite = false`。
+  **シーンで最初に描かれ、他のオブジェクトはすべてその上に乗る**。
+- 深度を書かないので、メインシーンとの前後関係は常に「奥」。
+- Skybox を残す場合は Skybox 側の `renderOrder` を -2000 にして先に描く
+  （WebGPU が使えない環境では Skybox が見える、というフォールバックになる）。
+- すでに -1000 未満の `renderOrder` を使っているオブジェクトがあると、それは背景の下に潜る。
+
 ## ステレオと XR
 
-`GpuWorkerView` は `stereo` でモニタでも 2 視点（SBS）になる。XR 中は自動で 2 視点。
+`GpuBackdrop` は `stereo` でモニタでも 2 視点（SBS）になる。XR 中は自動で 2 視点。
 
 - フレームメッセージは `views: ViewMatrices[]`（1 要素 = 単眼、2 要素 = 左右）。
 - Worker は **アトラス**（横並び）で描く。キャンバスの横幅は「1 視点ぶん × 視点数」で、
@@ -105,7 +118,7 @@ three の XR は **1 回の `render()` で両目を描く**。`projectObject` �
 両目で共有される。そのため `mesh.layers.set(1)` / `set(2)` では目ごとに出し分けられない
 （両目に両方のメッシュが描かれる）。
 
-代わりに `GpuWorkerView` は **板ポリ 1 枚 + シェーダで目を判定**する。
+代わりに `GpuBackdrop` は **板ポリ 1 枚 + シェーダで目を判定**する。
 
 - 描画中の `cameraPosition` / `viewMatrix` は目ごとに切り替わる。
 - `dot(cameraPosition - uHeadPosition, right) > 0` なら右目（`right` は view 行列の 1 行目）。
@@ -114,15 +127,14 @@ three の XR は **1 回の `render()` で両目を描く**。`projectObject` �
 ### XR の視点と射影
 
 - 視点は `gl.xr.getCamera().cameras[0..1]`（目の位置）。
-- 射影行列は **左右共通（union）** を使う。スクリーンは 1 枚の板なので、画像が板全体に
-  正しく貼れる。視差は目の位置の違いだけで付く。
-- 板は両目の中間に置き、`cameraXR.projectionMatrix`（union）から視錐台の矩形を求めて
-  大きさを合わせる（非対称フラスタムでも画面いっぱいになる）。
-- 目のアスペクトが分かった時点で Worker の解像度を合わせ直す（`xrAspect` state）。
+- 射影行列は **その目自身のもの** を送る。板ポリはスクリーン空間で目ごとの
+  ビューポートいっぱいに広がるので、画像の画角がメインシーンと一致する。
+- 目のアスペクト（`P[5] / P[0]`）が分かった時点で Worker の解像度を合わせ直す
+  （`xrAspect` state）。
 
 ### XR の制約
 
-- スクリーンはヘッドに追従する。3D の遮蔽はしない。
+- 背景はカメラに追従する（視差なし）。3D の遮蔽はしない。
 - **深度合成は XR ではできない**。WebXR のフレームバッファはブラウザが所有し、
   メインシーンを自分の RT に描いてから目ごとに合成する経路が無い。
   `DepthComposite` は XR 中 `gl.render(scene, camera)` にフォールバックする。
@@ -179,8 +191,7 @@ WebGL2 には `gl_FragDepth` が無いので、**深度を「書く」ことは�
 
 - `src/worker/demoScene.ts`: `PARTICLE_COUNT`、`particleMaterial.scaleNode`（粒の大きさ）、
   `flowX/Y/Z` の係数（流れ）、`renderer.toneMappingExposure`、ライトの強さ。
-- `GpuWorkerView`: `coverage` / `anchor` / `margin` / `distance` / `maxWidth` / `resolutionScale` /
-  `maxFps` / `stereo` / `depthTest`。
+- `GpuBackdrop`: `maxWidth` / `resolutionScale` / `maxFps` / `stereo` / `enabled`。
 - `DepthComposite`: `stereo` / `maxWidth` / `resolutionScale` / `maxFps` / `debug`。
   Worker の露出は `uWorkerExposure`（既定 1.15）。
 

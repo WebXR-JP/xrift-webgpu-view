@@ -1,12 +1,14 @@
 # @xrift/webgpu-view
 
 Worker の中で WebGPU（three.js の `WebGPURenderer`）で描いたシーンを `ImageBitmap` として受け取り、
-React Three Fiber のキャンバスに「カメラ追従のスクリーン」として出すためのライブラリ。
+React Three Fiber のキャンバスの **全画面の背景** として出すためのライブラリ。
 
-- **通常（モニタ）**: カメラの視錐台に合わせた板ポリに貼る。画面いっぱいにもパネルにもできる
-- **XR**: 左右の目ぶんを 1 フレームで描き（アトラス）、両眼に正しいステレオで出す
-- **深度合成はしない**: メインシーンとの前後関係は「スクリーンとして手前に出す」だけ。
-  深度合成は `@xrift/webgpu-view/experimental` に内部実験として置いてある（XR 非対応）
+Skybox の置き換えを想定している。
+
+- **通常（モニタ）**: 画面全体を覆う板ポリをシーンより先に描く
+- **XR**: 左右の目ぶんを 1 フレームで描き（アトラス）、目ごとのビューポートいっぱいに出す
+- **深度は書かない**: メインシーンのオブジェクトは常に手前（背景より奥には何も描かれない）
+- 深度を比較して合成する実験は `@xrift/webgpu-view/experimental` に分けてある（XR 非対応）
 
 ```
 メインスレッド                        Worker
@@ -14,9 +16,10 @@ React Three Fiber のキャンバスに「カメラ追従のスクリーン」�
 │ カメラ行列 (mono/XR)  │ ────────▶ │ WebGPURenderer          │
 │                      │           │  scene ← 利用者のコード   │
 │ Texture ◀────────────┼─ bitmap ──│  viewport を横に並べて描く │
-│ 板ポリ (1 枚)         │           └────────────────────────┘
+│ 全画面の板ポリ        │           └────────────────────────┘
+│ (renderOrder -1000)  │
 └──────────────────────┘
-   XR は目の位置でアトラスの左右を選ぶ
+   ↑ これを最初に描き、メインシーンがその上に乗る
 ```
 
 ## インストール
@@ -69,13 +72,13 @@ defineGpuWorker(({ renderer }) => {
 ### 2. コンポーネントを置く
 
 ```tsx
-import { GpuWorkerView } from '@xrift/webgpu-view'
+import { GpuBackdrop } from '@xrift/webgpu-view'
 import MyWorker from './my.worker.ts?worker'
 
 export const World = () => (
   <>
     <ambientLight />
-    <GpuWorkerView worker={MyWorker} coverage={0.6} anchor="bottom-right" />
+    <GpuBackdrop worker={MyWorker} />
   </>
 )
 ```
@@ -83,25 +86,31 @@ export const World = () => (
 `?worker` は **利用者側のコード** に書く（Vite が Worker チャンクを作る）。
 `new Worker(new URL(...))` は `npx xrift check world` に REJECT されるので使わない。
 
+## 描画順（背景として置く）
+
+板ポリは `renderOrder = -1000`、`depthTest = false`、`depthWrite = false` で描かれる。
+つまり **シーンの中で最初に描かれ、他のオブジェクトはすべてその上に乗る**。
+
+- 既存の Skybox を残したい場合は、Skybox 側の `renderOrder` をさらに小さくする
+  （例: `-2000`）。WebGPU が使えない環境では Skybox が見える、というフォールバックになる。
+- すでに `renderOrder` に -1000 未満を使っているオブジェクトがあると、その物体は
+  背景の下に潜る。
+- メインシーンの透明物は背景の上に描かれる（深度は書いていないので前後関係は常に「奥」）。
+
 ## API
 
-### `GpuWorkerView`
+### `GpuBackdrop`
 
 | prop | 既定 | 説明 |
 | --- | --- | --- |
 | `worker` | — | `?worker` import の既定エクスポート |
 | `workerData` | — | Worker 起動時に 1 回だけ渡す任意のデータ（`init.data`） |
-| `coverage` | `0.6` | 画面に対する大きさ。`1` で画面いっぱい |
-| `anchor` | `'center'` | `'top-left' \| 'top-right' \| 'bottom-left' \| 'bottom-right'` |
-| `margin` | `0.03` | 画面端からの余白（NDC。1 で画面の半分） |
-| `distance` | `1` | カメラからの距離（m）。見た目の大きさは `coverage` で決まる |
 | `maxWidth` | `1280` | Worker の解像度上限（1 視点ぶんの横幅 px） |
 | `resolutionScale` | `1` | `devicePixelRatio` に掛ける |
 | `maxFps` | `60` | Worker を描画する最大頻度 |
-| `enabled` | `true` | `false` で停止（最後のフレームを保持） |
+| `enabled` | `true` | `false` で停止（背景が消える） |
 | `stereo` | `false` | モニタでも 2 視点（SBS）。XR 中は自動で 2 視点 |
 | `eyeSeparation` | `0.064` | SBS の眼間距離（m） |
-| `depthTest` | `false` | `true` にするとシーンの手前の物で隠れる |
 | `onReady` / `onError` | — | `{ backend, adapter, width, height, meta }` / エラーメッセージ |
 | `debug` | `false` | コンソールに ready と fps を出す |
 
@@ -136,7 +145,7 @@ interface GpuWorkerScene {
 
 ### `useGpuWorker`
 
-`GpuWorkerView` の中身。テクスチャだけ欲しい / 自分で板ポリを貼りたい場合はこちら。
+`GpuBackdrop` の中身。テクスチャだけ欲しい / 自分で板ポリを貼りたい場合はこちら。
 
 ```ts
 const { colorTexture, hasFrame, error } = useGpuWorker({
@@ -150,18 +159,22 @@ const { colorTexture, hasFrame, error } = useGpuWorker({
 
 ## XR の挙動
 
-XR 中はブラウザが用意した目のカメラを使い、**左右の目ぶんを 1 フレームで横に並べて描く**
-（アトラス）。メイン側の板ポリは 1 枚で、シェーダが `cameraPosition`（目ごとに切り替わる）から
-どちらの目かを判定してアトラスの該当半分を引く。
+XR 中はブラウザが用意した目のカメラをそのまま使い、**左右の目ぶんを 1 フレームで
+横に並べて描く**（アトラス）。
 
-- スクリーンはヘッドの前方に置かれる（頭に追従する）
-- 3D の遮蔽はしない。メインシーンの物はスクリーンより奥でも手前に描かれない
-- 視差は「目の位置の違い」で付く。両目の射影行列は共通（union）にしてある
-- 目のアスペクトが分かった時点で Worker の解像度を合わせ直す
+- 板ポリはスクリーン空間（NDC）の四角形で、目ごとのビューポートをそのまま覆う。
+  射影を通さないので、非対称なフラスタムでも隙間が出ない。
+- シェーダが `cameraPosition`（目ごとに切り替わる）からどちらの目かを判定し、
+  アトラスの該当半分を引く。three の XR は 1 回の `render()` で両目を描くが、
+  そのとき `viewMatrix` / `cameraPosition` は目ごとに切り替わる。
+- Worker には **目ごとの射影行列** を送る。画像はその目のビューポートいっぱいに貼るので、
+  メインシーンと画角が一致する。
+- 目のアスペクトが分かった時点で Worker の解像度を合わせ直す。
 
-深度合成（メインシーンとピクセル単位で前後を比較する方式）は WebXR では動かない。
+3D の遮蔽はしない。WebGPU のシーンは常にメインシーンより奥になる。
+深度を比較して合成する方式（`experimental/DepthComposite`）は WebXR では動かない。
 WebXR のフレームバッファはブラウザが所有しており、メインシーンを自分の RT に描いてから
-目ごとに合成する経路が無いため。XR 中は合成せず通常描画にフォールバックする。
+目ごとに合成する経路が無いため。
 
 ## 実験機能（`@xrift/webgpu-view/experimental`）
 
@@ -189,13 +202,11 @@ import { DepthComposite } from '@xrift/webgpu-view/experimental'
   Worker チャンクに `three/webgpu` が丸ごと入る（約 2.2MB）。メインの `three`（WebGL）とは
   別インスタンスになるので、シーンやジオメトリは共有できない。
 - **Worker の配信 URL は絶対パス**（`/xxx-worker-<hash>.js`）。CDN がサブパス配信の場合は
-  `vite.config.ts` の `base` を合わせる。合わないとパネルが出ないだけ（メイン世界は動く）。
-- WebGPU 非対応の環境では Worker が `error` を返し、スクリーンは非表示のまま。
+  `vite.config.ts` の `base` を合わせる。合わないと背景が出ないだけ（メイン世界は動く）。
+- WebGPU 非対応の環境では Worker が `error` を返し、背景は非表示のまま。
   メインシーンは通常どおり動く（fail-safe）。
-- **`renderer.setViewport` / `setScissor` は CSS ピクセル指定**。three が内部で
-  `pixelRatio` を掛けるので、RT の実ピクセルを渡すとズレる。
-- スクリーンはカメラに追従する。ワールドに固定したい場合は `enabled` と併用して
-  自前の板ポリに `colorTexture` を貼る（`useGpuWorker` を使う）。
+- 背景はカメラに追従する（視差なし）。ワールドに固定したい場合は `useGpuWorker` を
+  使って自前の板ポリに `colorTexture` を貼る。
 
 ## 開発
 

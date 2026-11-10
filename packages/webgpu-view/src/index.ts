@@ -5,8 +5,8 @@
  * 深度合成はここには含めない（`@xrift/webgpu-view/experimental`）。
  */
 
-export { GpuWorkerView } from './GpuWorkerView'
-export type { GpuWorkerViewProps } from './GpuWorkerView'
+export { GpuBackdrop } from './GpuBackdrop'
+export type { GpuBackdropProps } from './GpuBackdrop'
 export { useGpuWorker } from './useGpuWorker'
 export type {
   GpuWorkerReadyInfo,
@@ -14,6 +14,4 @@ export type {
   UseGpuWorkerResult,
   WorkerConstructor,
 } from './useGpuWorker'
-export { getFrustumRect } from './frustum'
-export type { FrustumRect, ViewAnchor, ViewRectOptions } from './frustum'
 export type { FrameRequest, Mat4, ViewMatrices, WorkerResponse } from './protocol'
