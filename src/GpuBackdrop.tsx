@@ -134,8 +134,11 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
   const [xrAspect, setXrAspect] = useState<number | null>(null)
 
   const eyeCount = xrAspect !== null ? 2 : stereo ? 2 : 1
-  const displayAspect = size.width / Math.max(1, size.height)
-  const imageAspect = xrAspect ?? displayAspect
+  const displayAspect =
+    size.width > 0 && size.height > 0 ? size.width / size.height : 1
+  // XR のアスペクトが壊れている（0 / NaN）ときはモニタのアスペクトで代用する
+  const imageAspect =
+    xrAspect !== null && Number.isFinite(xrAspect) && xrAspect > 0 ? xrAspect : displayAspect
 
   // --- Worker 側の解像度（1 視点ぶん） --------------------------------------
   const resolution = useMemo(() => {
@@ -143,6 +146,7 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
       64,
       Math.min(maxWidth, Math.round((size.width * dpr * resolutionScale) / eyeCount)),
     )
+    // アスペクトが 0 / NaN のときに高さが Infinity にならないようにする
     return { width, height: Math.max(1, Math.round(width / imageAspect)) }
   }, [size.width, dpr, resolutionScale, maxWidth, eyeCount, imageAspect])
 

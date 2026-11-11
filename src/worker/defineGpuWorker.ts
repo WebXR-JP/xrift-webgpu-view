@@ -14,6 +14,7 @@
 
 import { MeshBasicNodeMaterial, PerspectiveCamera, WebGPURenderer } from 'three/webgpu'
 import { clamp, positionView, sRGBTransferEOTF, vec3 } from 'three/tsl'
+import { MAX_DIMENSION, normalizeDimension } from '../protocol'
 import type { FrameRequest, ViewMatrices, WorkerRequest, WorkerResponse } from '../protocol'
 import type { GpuWorkerScene, GpuWorkerSceneFactory } from './types'
 
@@ -36,10 +37,18 @@ let userScene: GpuWorkerScene | null = null
 /** 視点ごとのカメラ（[0] が単眼 or 左目、[1] が右目） */
 const cameras: PerspectiveCamera[] = []
 
-/** 1 視点ぶんのサイズ。canvas は横に viewCount 並べたアトラスになる */
-let size = { width: 0, height: 0 }
-/** 現在の視点数（1 = 単眼 / 2 = ステレオ） */
-let viewCount = 1
+/**
+ * 1 視点ぶんの目標サイズ。canvas はこれを視点数ぶん横に並べたアトラスになる。
+ *
+ * `resize` で来た値をその場で renderer に適用すると、描画中のフレームと
+ * canvas のサイズが食い違い、`transferToImageBitmap()` が失敗することがある。
+ * そのため適用は次の描画の直前（`applyCanvasSize`）にまとめて行う。
+ */
+let targetSize = { width: 0, height: 0 }
+/** renderer / canvas に適用済みのアトラス全体のサイズ */
+let appliedSize = { width: 0, height: 0 }
+/** 実際に描画に使っている 1 視点ぶんのサイズ */
+let viewSize = { width: 0, height: 0 }
 
 let initialized = false
 let busy = false
@@ -75,20 +84,29 @@ function applyView(camera: PerspectiveCamera, { view, projection, camera: info }
 }
 
 /**
- * 視点数が変わったら canvas（アトラス）のサイズを合わせる。
- * size は 1 視点ぶん。
+ * 目標サイズと視点数を canvas / renderer に反映する。
+ * 描画の直前にだけ呼ぶ（描画中のサイズ変更を避けるため）。
  */
-function applyViewCount(count: number) {
-  if (!renderer || count === viewCount || size.width === 0) return
-  viewCount = count
-  renderer.setSize(size.width * count, size.height, false)
+function applyCanvasSize(count: number) {
+  const perViewWidth = normalizeDimension(targetSize.width)
+  const perViewHeight = normalizeDimension(targetSize.height)
+  // ステレオでも 1 辺の上限を超えないようにする
+  const totalWidth = normalizeDimension(perViewWidth * count, MAX_DIMENSION)
+
+  viewSize = { width: Math.floor(totalWidth / count), height: perViewHeight }
+
+  if (!renderer) return
+  if (appliedSize.width === totalWidth && appliedSize.height === perViewHeight) return
+
+  renderer.setSize(totalWidth, perViewHeight, false)
+  appliedSize = { width: totalWidth, height: perViewHeight }
 }
 
 /** アトラス（横並び）の 1 視点分にビューポートとシザーを合わせる */
 function applyViewport(index: number) {
   if (!renderer) return
-  renderer.setViewport(index * size.width, 0, size.width, size.height)
-  renderer.setScissor(index * size.width, 0, size.width, size.height)
+  renderer.setViewport(index * viewSize.width, 0, viewSize.width, viewSize.height)
+  renderer.setScissor(index * viewSize.width, 0, viewSize.width, viewSize.height)
   renderer.setScissorTest(true)
 }
 
@@ -154,7 +172,8 @@ async function renderFrame(frame: FrameRequest) {
 
   // ステレオは最大 2 視点。アトラスの横幅を等分して描く
   const count = Math.min(2, Math.max(1, frame.views.length))
-  applyViewCount(count)
+  // サイズ（resize）は描画の直前まで遅らせて反映する
+  applyCanvasSize(count)
   for (let i = 0; i < count; i++) {
     applyView(getCamera(i), frame.views[i])
   }
@@ -177,8 +196,8 @@ async function renderFrame(frame: FrameRequest) {
       id: frame.id,
       bitmap,
       depthBitmap: depthBitmap ?? undefined,
-      width: size.width * count,
-      height: size.height,
+      width: appliedSize.width,
+      height: appliedSize.height,
       renderMs: performance.now() - started,
     },
     depthBitmap ? [bitmap, depthBitmap] : [bitmap],
@@ -197,20 +216,25 @@ async function flush() {
       await renderFrame(frame)
     }
   } catch (error) {
-    scope.postMessage({ type: 'error', message: String(error) })
+    // 1 フレームの失敗で描画ループを止めない（resize 直後など一時的に失敗することがある）。
+    // 止めてよいのは初期化失敗だけ。
+    scope.postMessage({ type: 'error', message: String(error), fatal: false })
   } finally {
     busy = false
   }
 }
 
-async function init(width: number, height: number, data?: unknown) {
+async function init(data?: unknown) {
   if (typeof navigator === 'undefined' || !navigator.gpu) {
     throw new Error('この Worker では navigator.gpu が利用できません（WebGPU 非対応のブラウザ / Worker）')
   }
 
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
 
-  canvas = new OffscreenCanvas(width, height)
+  const perViewWidth = normalizeDimension(targetSize.width)
+  const perViewHeight = normalizeDimension(targetSize.height)
+
+  canvas = new OffscreenCanvas(perViewWidth, perViewHeight)
   renderer = new WebGPURenderer({
     canvas,
     antialias: true,
@@ -218,17 +242,17 @@ async function init(width: number, height: number, data?: unknown) {
     powerPreference: 'high-performance',
   })
   renderer.setPixelRatio(1)
-  renderer.setSize(width, height, false)
+  applyCanvasSize(1)
 
   await renderer.init()
 
-  userScene = await factory({ width, height, renderer, canvas, data })
+  userScene = await factory({ width: perViewWidth, height: perViewHeight, renderer, canvas, data })
   if (wantDepth) depthMaterial = createDepthMaterial()
 
   // 最初の 'frame' が来るまでの見た目
   const warmupCamera = getCamera(0)
   warmupCamera.position.set(0, 1.7, 8)
-  warmupCamera.aspect = width / height
+  warmupCamera.aspect = perViewWidth / perViewHeight
   warmupCamera.updateProjectionMatrix()
   userScene.warmup?.(warmupCamera)
   warmupCamera.updateMatrixWorld()
@@ -266,32 +290,39 @@ scope.onmessage = async (event) => {
   const message = event.data
 
   if (message.type === 'init') {
-    size = { width: message.width, height: message.height }
+    targetSize = {
+      width: normalizeDimension(message.width),
+      height: normalizeDimension(message.height),
+    }
     wantDepth = message.depth === true
 
     if (initialized) return
 
     try {
-      const info = await init(size.width, size.height, message.data)
+      const info = await init(message.data)
       initialized = true
       scope.postMessage({
         type: 'ready',
-        width: size.width,
-        height: size.height,
+        width: normalizeDimension(targetSize.width),
+        height: normalizeDimension(targetSize.height),
         backend: info.backend,
         adapter: info.adapter,
         meta: userScene?.meta,
       })
     } catch (error) {
-      scope.postMessage({ type: 'error', message: String(error) })
+      scope.postMessage({ type: 'error', message: String(error), fatal: true })
     }
     return
   }
 
   if (message.type === 'resize') {
-    size = { width: message.width, height: message.height }
-    if (!renderer) return
-    renderer.setSize(size.width * viewCount, size.height, false)
+    // 反映は次の描画の直前（renderFrame → applyCanvasSize）に回す。
+    // ここで renderer.setSize() すると、描画中のフレームと canvas のサイズが
+    // 食い違って transferToImageBitmap() が失敗することがある。
+    targetSize = {
+      width: normalizeDimension(message.width),
+      height: normalizeDimension(message.height),
+    }
     return
   }
 
@@ -310,5 +341,7 @@ scope.onmessage = async (event) => {
     renderer?.dispose()
     renderer = null
     initialized = false
+    appliedSize = { width: 0, height: 0 }
+    viewSize = { width: 0, height: 0 }
   }
 }

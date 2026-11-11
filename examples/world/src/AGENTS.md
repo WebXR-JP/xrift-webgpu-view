@@ -196,6 +196,18 @@ WebGL2 には `gl_FragDepth` が無いので、**深度を「書く」ことは�
 
 - `ImageBitmap` は使い終わったら `close()` する。メイン側は 1 フレーム遅らせて解放している
   （アップロード前に閉じると壊れる）。
+- **リサイズで画像サイズが変わったらテクスチャを作り直す**（`useGpuWorker` の
+  `updateTexture`）。three は同じ `Source` のまま画像を差し替えると最初に確保した領域を
+  使い回すので、画像が大きくなると `texSubImage2D` がはみ出して `GL_INVALID_VALUE` になる。
+  その場合フレームは届いているのに背景が固まる（これが「リサイズ後に止まる」の正体）。
+- **Worker の `resize` は描画直前にまとめて適用する**（`targetSize` → `applyCanvasSize`）。
+  `resize` メッセージの処理中に `renderer.setSize()` すると、描画中のフレームと
+  canvas のサイズが食い違って `transferToImageBitmap()` が失敗することがある。
+- サイズは必ず `normalizeDimension()`（`protocol.ts`）で 1 以上の有限整数にしてから
+  canvas / renderer に渡す。0 や `Infinity` を渡すと例外になり描画ループが止まる
+  （`Math.max(1, Math.round(width / 0))` が `Infinity` になるケースに注意）。
+- フレーム描画の失敗は `fatal: false` として通知し、メイン側は描画を続ける
+  （初期化失敗だけが `fatal: true`）。
 - `sRGBTransferEOTF()` で深度パス出力を事前に打ち消している（出力段で sRGB エンコードされるため）。
 - パーティクルは TSL の `instancedArray` + `Fn().compute()` で GPU 上で更新する。
   描画は `SpriteNodeMaterial` の `positionNode = positions.toAttribute()` と `THREE.Sprite` の

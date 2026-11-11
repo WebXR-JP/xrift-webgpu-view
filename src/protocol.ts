@@ -7,6 +7,24 @@
 /** 行列は three.js と同じ column-major の 16 要素 */
 export type Mat4 = number[]
 
+/**
+ * 1 辺の上限（px）。GPU のテクスチャ上限に合わせる。
+ * アトラス（ステレオで横 2 倍）でもこの値を超えないように丸める。
+ */
+export const MAX_DIMENSION = 16384
+
+/**
+ * 描画サイズを canvas に渡せる値へ丸める。
+ *
+ * `0` / 負数 / `NaN` / `Infinity` をそのまま `canvas.width` 等へ代入すると
+ * `TypeError` になり、Worker の描画ループが止まる。ウィンドウを極端に細くしたときや
+ * アスペクト比が 0 になったときに発生しうるので、必ず 1 以上の有限整数にする。
+ */
+export function normalizeDimension(value: number, max = MAX_DIMENSION) {
+  if (!Number.isFinite(value)) return 1
+  return Math.min(max, Math.max(1, Math.round(value)))
+}
+
 export interface InitRequest {
   type: 'init'
   /** 1 視点ぶんの横幅（px）。キャンバスはこれを視点数ぶん横に並べたアトラスになる */
@@ -79,6 +97,11 @@ export interface ReadyResponse {
 export interface ErrorResponse {
   type: 'error'
   message: string
+  /**
+   * 描画を継続できないエラーか（既定 true）。
+   * 初期化失敗は true、1 フレームの描画失敗は false（次のフレームを続ける）。
+   */
+  fatal?: boolean
 }
 
 export interface FrameResponse {

@@ -288,7 +288,8 @@ export const DepthComposite: React.FC<DepthCompositeProps> = ({
 
   // --- Worker の解像度（1 視点あたり） --------------------------------------
   const resolution = useMemo(() => {
-    const aspect = size.height / Math.max(1, size.width)
+    // 幅が 0 のときに高さが Infinity にならないようにする
+    const aspect = size.width > 0 && size.height > 0 ? size.height / size.width : 1
     const totalWidth = size.width * dpr * resolutionScale
     const width = Math.max(64, Math.min(maxWidth, Math.round(totalWidth / eyeCount)))
     return { width, height: Math.max(1, Math.round(width * aspect)) }

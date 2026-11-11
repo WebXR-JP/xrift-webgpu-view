@@ -217,6 +217,11 @@ import { DepthComposite } from '@webxr-jp/webgpu-view/experimental'
 - **Worker の生成は `?worker` import 経由**にする。`new Worker(new URL(...))` は
   `@xrift/code-security` が「権限未宣言の通信」として弾く。
 - **`ImageBitmap` は `flipY` が効かない**。テクスチャは上下反転で入る。
+- **ウィンドウのリサイズで画像サイズが変わると、テクスチャを作り直す**。
+  three は同じ `Source` のまま画像だけ差し替えると最初に確保した領域を使い回すため、
+  画像が大きくなると転送がはみ出して `GL_INVALID_VALUE` になり、**背景が固まる**
+  （フレームは届いているのにテクスチャが更新されない）。`useGpuWorker` がサイズ変化を
+  検出して `Source` ごと作り直す。自前で `colorTexture` を扱う場合も同じ注意が必要。
 - **バンドルサイズ**: `three/webgpu` は Module Federation の `shared` 対象外なので、
   Worker チャンクに `three/webgpu` が丸ごと入る（約 2.2MB）。メインの `three`（WebGL）とは
   別インスタンスになるので、シーンやジオメトリは共有できない。

@@ -12,9 +12,18 @@
 import { useFrame } from '@react-three/fiber'
 import type { RootState } from '@react-three/fiber'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { LinearFilter, NearestFilter, PerspectiveCamera, SRGBColorSpace, Texture } from 'three'
+import { LinearFilter, NearestFilter, PerspectiveCamera, Source, SRGBColorSpace, Texture } from 'three'
+import { normalizeDimension } from './protocol'
 import type { WorkerResponse } from './protocol'
 import type { FrameRequest, ViewMatrices } from './protocol'
+
+/**
+ * Worker から結果が返らないまま待つ上限（ms）。
+ * これを超えたら「結果待ち」を解除して次のフレームを送り直す。
+ * Worker が落ちたり 1 フレームだけ失敗して応答が来なくなっても、
+ * 描画が止まったままにならないようにするため。
+ */
+const FRAME_TIMEOUT_MS = 2000
 
 /** Vite の `?worker` import が返すコンストラクタ */
 export type WorkerConstructor = new () => Worker
@@ -85,6 +94,27 @@ function createTexture(nearest: boolean) {
   return texture
 }
 
+/**
+ * テクスチャに新しい ImageBitmap を反映する。
+ *
+ * three は同じ `Source` のまま画像だけ差し替えると、最初に確保した
+ * テクスチャ領域のサイズを再利用する。ウィンドウを広げて画像が大きくなると
+ * 転送が領域をはみ出して `GL_INVALID_VALUE` になり、**表示が固まったまま**になる
+ * （フレームは届いているのにテクスチャが更新されない）。
+ * サイズが変わったときだけ `Source` ごと作り直して領域を確保し直す。
+ */
+function updateTexture(texture: Texture, bitmap: ImageBitmap) {
+  const previous = texture.image as ImageBitmap | null
+  if (!previous || previous.width !== bitmap.width || previous.height !== bitmap.height) {
+    // 古い領域を GL 側で解放してから、新しいサイズで作り直す
+    texture.dispose()
+    texture.source = new Source(bitmap)
+  } else {
+    texture.image = bitmap
+  }
+  texture.needsUpdate = true
+}
+
 export function useGpuWorker({
   worker: WorkerClass,
   workerData,
@@ -101,8 +131,11 @@ export function useGpuWorker({
   const workerRef = useRef<Worker | null>(null)
   const readyRef = useRef(false)
   const inFlightRef = useRef(false)
+  /** 最後にフレームを送った時刻（応答待ちのタイムアウト判定用） */
+  const sentAtRef = useRef(0)
   const frameIdRef = useRef(0)
   const lastSentRef = useRef(0)
+  const lastErrorMessageRef = useRef<string | null>(null)
   const stats = useRef({ frames: 0, renderMs: 0, since: performance.now() })
 
   const colorPending = useRef<ImageBitmap | null>(null)
@@ -170,14 +203,31 @@ export function useGpuWorker({
       }
 
       if (message.type === 'error') {
-        readyRef.current = false
-        setError(message.message)
-        onErrorRef.current?.(message.message)
-        console.error('[webgpu-view]', message.message)
+        // 結果待ちを解除して次のフレームを止めない。
+        // 止めてよいのは初期化失敗（fatal）だけ。
+        // resize 直後などは 1 フレームだけ失敗することがあり、
+        // そこで `ready` を落とすとそのまま描画が再開しなくなる。
+        inFlightRef.current = false
+        const fatal = message.fatal !== false
+        if (fatal) readyRef.current = false
+
+        // 同じエラーが毎フレーム続いてもログを溢れさせない
+        if (lastErrorMessageRef.current !== message.message) {
+          lastErrorMessageRef.current = message.message
+          if (fatal) {
+            setError(message.message)
+            onErrorRef.current?.(message.message)
+            console.error('[webgpu-view]', message.message)
+          } else {
+            // 一時的な失敗。次のフレームで復帰するので `error` にはしない
+            console.warn('[webgpu-view] frame failed (継続します):', message.message)
+          }
+        }
         return
       }
 
       inFlightRef.current = false
+      lastErrorMessageRef.current = null
       stats.current.frames++
       stats.current.renderMs += message.renderMs
 
@@ -202,13 +252,23 @@ export function useGpuWorker({
     }
 
     worker.onerror = (event) => {
+      // 1 回の例外で恒久的に止めない（次のフレームを送れるように結果待ちを解除する）
+      inFlightRef.current = false
+      if (lastErrorMessageRef.current === event.message) return
+      lastErrorMessageRef.current = event.message
       setError(event.message)
       onErrorRef.current?.(event.message)
       console.error('[webgpu-view] worker error:', event.message)
     }
 
     const { width: w, height: h, internalDepth: d, workerData: data } = optionsRef.current
-    worker.postMessage({ type: 'init', width: w, height: h, depth: d, data })
+    worker.postMessage({
+      type: 'init',
+      width: normalizeDimension(w),
+      height: normalizeDimension(h),
+      depth: d,
+      data,
+    })
 
     return () => {
       workerRef.current = null
@@ -228,7 +288,11 @@ export function useGpuWorker({
 
   // --- リサイズ -----------------------------------------------------------
   useEffect(() => {
-    workerRef.current?.postMessage({ type: 'resize', width, height })
+    workerRef.current?.postMessage({
+      type: 'resize',
+      width: normalizeDimension(width),
+      height: normalizeDimension(height),
+    })
   }, [width, height])
 
   // --- 毎フレーム: テクスチャ更新 + カメラ送信 -----------------------------
@@ -238,8 +302,7 @@ export function useGpuWorker({
     const colorBitmap = colorPending.current
     if (colorBitmap) {
       colorPending.current = null
-      color.image = colorBitmap
-      color.needsUpdate = true
+      updateTexture(color, colorBitmap)
 
       // 前回の bitmap はこのフレームで転送済みなので解放してよい
       colorRetired.current?.close()
@@ -251,14 +314,22 @@ export function useGpuWorker({
     const depthBitmap = depthPending.current
     if (depthBitmap && depthTexture) {
       depthPending.current = null
-      depthTexture.image = depthBitmap
-      depthTexture.needsUpdate = true
+      updateTexture(depthTexture, depthBitmap)
 
       depthRetired.current?.close()
       depthRetired.current = depthBitmap
     }
 
-    if (!enabled || !readyRef.current || inFlightRef.current) return
+    if (!enabled || !readyRef.current) return
+
+    if (inFlightRef.current) {
+      // 応答が返らないまま止まったままにしない（Worker のクラッシュ / 1 フレームの失敗）
+      if (performance.now() - sentAtRef.current < FRAME_TIMEOUT_MS) return
+      inFlightRef.current = false
+      if (debugRef.current) {
+        console.warn('[webgpu-view] frame response timed out; retrying')
+      }
+    }
 
     const time = state.clock.elapsedTime
     if (time - lastSentRef.current < 1 / maxFps) return
@@ -290,6 +361,7 @@ export function useGpuWorker({
     }
 
     inFlightRef.current = true
+    sentAtRef.current = performance.now()
     workerRef.current?.postMessage(message)
   })
 
