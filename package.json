@@ -1,6 +1,6 @@
 {
   "name": "@webxr-jp/webgpu-view",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run a WebGPU scene in a Worker and show it in a React Three Fiber canvas (monitor and XR).",
   "type": "module",
   "license": "MIT",
