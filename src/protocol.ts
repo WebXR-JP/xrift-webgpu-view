@@ -36,6 +36,13 @@ export interface InitRequest {
    * @internal experimental/DepthComposite 専用。通常のビューでは使わない。
    */
   depth?: boolean
+  /**
+   * 区間別の計測を有効にするか（既定 false）。
+   *
+   * true のときだけ Worker は `trackTimestamp` を有効にし、
+   * `FrameResponse.timings` を返す。false のときは従来どおり計測しない。
+   */
+  profile?: boolean
   /** シーン側へ渡す任意のデータ（structured clone できるもの） */
   data?: unknown
 }
@@ -104,6 +111,34 @@ export interface ErrorResponse {
   fatal?: boolean
 }
 
+/**
+ * Worker 側 1 フレームの区間別計測（`InitRequest.profile` が true のときだけ送られる）。
+ *
+ * 数値の意味を区別するための定義:
+ * - `updateMs` / `renderMs` / `snapshotMs` は Worker 内の JS 区間時間
+ *  （`performance.now()` の差）。`renderMs` は `renderer.render()` の呼び出し時間で、
+ *   GPU の完了待ちは含まない（完了待ちを含みうるのは `snapshotMs`）。
+ * - `gpuRenderMs` / `gpuComputeMs` は GPU 上の実実行時間（timestamp-query）。
+ *   取れない環境では `undefined` のままになる。
+ * - `totalMs` は描画要求の受領から `postMessage` 直前までの全体。
+ *
+ * @internal 計測用（profile: true のときだけ返る）。公開 API ではない。
+ */
+export interface FrameTimings {
+  /** userScene.update（パーティクルの compute 発行を含む）の JS 時間 (ms) */
+  updateMs: number
+  /** 描画ループ（renderer.render）の JS 時間 (ms) */
+  renderMs: number
+  /** transferToImageBitmap の時間 (ms)。GPU 完了待ちを含みうる */
+  snapshotMs: number
+  /** renderFrame 全体（postMessage 直前まで）(ms) */
+  totalMs: number
+  /** GPU の描画パス実時間 (ms)。timestamp-query が使えないときは undefined */
+  gpuRenderMs?: number
+  /** GPU の compute パス実時間 (ms)。同上 */
+  gpuComputeMs?: number
+}
+
 export interface FrameResponse {
   type: 'result'
   id: number
@@ -114,8 +149,10 @@ export interface FrameResponse {
   /** アトラス全体のサイズ */
   width: number
   height: number
-  /** Worker 側で 1 フレーム描画に要した時間（ms） */
+  /** Worker 側で 1 フレーム描画に要した時間（ms）。timings.totalMs と同じ値 */
   renderMs: number
+  /** 区間別の内訳（profile: true のときだけ） */
+  timings?: FrameTimings
 }
 
 export type WorkerResponse = ReadyResponse | ErrorResponse | FrameResponse

@@ -58,6 +58,25 @@ let pending: FrameRequest | null = null
 let wantDepth = false
 let depthMaterial: MeshBasicNodeMaterial | null = null
 
+/**
+ * 区間別の計測をするか（`init` メッセージの `profile` で決まる。既定 false）。
+ * false のときは従来どおり計測も timestamp-query も行わない。
+ */
+let profile = false
+/**
+ * GPU 実時間の直近値。`resolveTimestampsAsync` は毎フレーム待つとヒッチになるため、
+ * profile 時のみ 30 フレームに 1 回だけ非同期に解決し、解決できるまで前回値を載せる。
+ * 載せる値はあくまで非同期サンプルであり、全フレーム平均ではない。
+ */
+let lastGpuRenderMs: number | undefined
+let lastGpuComputeMs: number | undefined
+let gpuResolving = false
+let profiledFrames = 0
+/** timestamp 解決の世代。init 開始と dispose で進め、古い解決を捨てる */
+let profileGeneration = 0
+/** GPU 時間を解決する間隔（フレーム数）。毎フレームの await を避けるため */
+const GPU_PROFILE_INTERVAL = 30
+
 function getCamera(index: number) {
   let camera = cameras[index]
   if (!camera) {
@@ -168,27 +187,84 @@ function createDepthMaterial() {
 async function renderFrame(frame: FrameRequest) {
   if (!renderer || !canvas || !userScene) return
 
-  const started = performance.now()
+  // 計測なしの通常経路。profile=false のときはここだけを使い、
+  // 余計な performance.now() 呼び出しも増やさない。
+  if (!profile) {
+    const started = performance.now()
 
-  // ステレオは最大 2 視点。アトラスの横幅を等分して描く
+    // ステレオは最大 2 視点。アトラスの横幅を等分して描く
+    const count = Math.min(2, Math.max(1, frame.views.length))
+    // サイズ（resize）は描画の直前まで遅らせて反映する
+    applyCanvasSize(count)
+    for (let i = 0; i < count; i++) {
+      applyView(getCamera(i), frame.views[i])
+    }
+
+    await userScene.update?.({ time: frame.time, delta: frame.delta, viewCount: count, renderer })
+
+    const depthBitmap = wantDepth ? await renderDepthPass(count) : null
+
+    for (let i = 0; i < count; i++) {
+      applyViewport(i)
+      renderer.render(userScene.scene, getCamera(i))
+    }
+    renderer.setScissorTest(false)
+
+    const bitmap = await snapshot(canvas)
+
+    scope.postMessage(
+      {
+        type: 'result',
+        id: frame.id,
+        bitmap,
+        depthBitmap: depthBitmap ?? undefined,
+        width: appliedSize.width,
+        height: appliedSize.height,
+        renderMs: performance.now() - started,
+      },
+      depthBitmap ? [bitmap, depthBitmap] : [bitmap],
+    )
+    return
+  }
+
+  // 計測ありの経路（profile: true のときだけ）。
+  const frameStart = performance.now()
+
   const count = Math.min(2, Math.max(1, frame.views.length))
-  // サイズ（resize）は描画の直前まで遅らせて反映する
   applyCanvasSize(count)
   for (let i = 0; i < count; i++) {
     applyView(getCamera(i), frame.views[i])
   }
 
+  const updateStart = performance.now()
   await userScene.update?.({ time: frame.time, delta: frame.delta, viewCount: count, renderer })
+  const updateMs = performance.now() - updateStart
 
+  // renderMs は renderer.render() の JS 呼び出し時間（深度パスを含む）。
+  // GPU の完了待ちは含まない。
+  const renderStart = performance.now()
   const depthBitmap = wantDepth ? await renderDepthPass(count) : null
-
   for (let i = 0; i < count; i++) {
     applyViewport(i)
     renderer.render(userScene.scene, getCamera(i))
   }
   renderer.setScissorTest(false)
+  const renderMs = performance.now() - renderStart
 
+  // snapshot は GPU 完了待ちを含みうる
+  const snapshotStart = performance.now()
   const bitmap = await snapshot(canvas)
+  const snapshotMs = performance.now() - snapshotStart
+
+  const totalMs = performance.now() - frameStart
+
+  // GPU 実時間は毎フレーム待つとヒッチになるため、N フレームに 1 回だけ非同期に解決する。
+  // 解決中・未対応・例外のときは前回値（または undefined）のまま載せる。
+  profiledFrames++
+  if (profiledFrames % GPU_PROFILE_INTERVAL === 0 && !gpuResolving) {
+    gpuResolving = true
+    void resolveGpuTimestamps()
+  }
 
   scope.postMessage(
     {
@@ -198,10 +274,42 @@ async function renderFrame(frame: FrameRequest) {
       depthBitmap: depthBitmap ?? undefined,
       width: appliedSize.width,
       height: appliedSize.height,
-      renderMs: performance.now() - started,
+      renderMs: totalMs,
+      timings: {
+        updateMs,
+        renderMs,
+        snapshotMs,
+        totalMs,
+        gpuRenderMs: lastGpuRenderMs,
+        gpuComputeMs: lastGpuComputeMs,
+      },
     },
     depthBitmap ? [bitmap, depthBitmap] : [bitmap],
   )
+}
+
+/**
+ * GPU の描画 / compute パスの実時間を非同期に解決して直近値に保存する。
+ * 未対応（WebGL フォールバックなど）や例外は握りつぶし、呼び出し側は待たない。
+ */
+async function resolveGpuTimestamps() {
+  const generation = profileGeneration
+  try {
+    const current = renderer
+    if (!current) return
+    const [render, compute] = await Promise.all([
+      current.resolveTimestampsAsync('render'),
+      current.resolveTimestampsAsync('compute'),
+    ])
+    // await 中に init / dispose で世代が進んでいたら古い解決として捨てる
+    if (generation !== profileGeneration) return
+    if (typeof render === 'number' && Number.isFinite(render)) lastGpuRenderMs = render
+    if (typeof compute === 'number' && Number.isFinite(compute)) lastGpuComputeMs = compute
+  } catch {
+    // 計測の失敗で描画を止めない
+  } finally {
+    gpuResolving = false
+  }
 }
 
 async function flush() {
@@ -225,6 +333,8 @@ async function flush() {
 }
 
 async function init(data?: unknown) {
+  // 開始時に世代を進め、進行中の古い timestamp 解決を無効化する
+  profileGeneration++
   if (typeof navigator === 'undefined' || !navigator.gpu) {
     throw new Error('この Worker では navigator.gpu が利用できません（WebGPU 非対応のブラウザ / Worker）')
   }
@@ -240,6 +350,8 @@ async function init(data?: unknown) {
     antialias: true,
     alpha: false,
     powerPreference: 'high-performance',
+    // profile のときだけ timestamp-query を有効にする（既定は従来どおり無効）
+    trackTimestamp: profile,
   })
   renderer.setPixelRatio(1)
   applyCanvasSize(1)
@@ -295,6 +407,7 @@ scope.onmessage = async (event) => {
       height: normalizeDimension(message.height),
     }
     wantDepth = message.depth === true
+    profile = message.profile === true
 
     if (initialized) return
 
@@ -334,6 +447,8 @@ scope.onmessage = async (event) => {
   }
 
   if (message.type === 'dispose') {
+    // 世代を進めて進行中の timestamp 解決を無効化する
+    profileGeneration++
     userScene?.dispose?.()
     userScene = null
     depthMaterial?.dispose()
@@ -343,5 +458,9 @@ scope.onmessage = async (event) => {
     initialized = false
     appliedSize = { width: 0, height: 0 }
     viewSize = { width: 0, height: 0 }
+    lastGpuRenderMs = undefined
+    lastGpuComputeMs = undefined
+    gpuResolving = false
+    profiledFrames = 0
   }
 }

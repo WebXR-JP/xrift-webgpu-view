@@ -9,6 +9,6 @@ import { createDemoScene } from './demoScene'
  * - DepthComposite: { toneMapping: false }（合成パス側で ACES を掛ける）
  */
 defineGpuWorker((init) => {
-  const options = (init.data ?? {}) as { toneMapping?: boolean }
-  return createDemoScene(init, { toneMapping: options.toneMapping !== false })
+  const options = (init.data ?? {}) as { toneMapping?: boolean; particles?: number }
+  return createDemoScene(init, { toneMapping: options.toneMapping !== false, particles: options.particles })
 })

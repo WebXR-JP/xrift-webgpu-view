@@ -66,9 +66,17 @@ export interface DemoSceneOptions {
    * - DepthComposite（実験）: false（合成パス側で ACES を掛ける）
    */
   toneMapping: boolean
+  /**
+   * GPU パーティクルの数（既定 40000）。
+   * 0 のときはパーティクル関連（instancedArray / compute / Sprite）を一切作らない。
+   */
+  particles?: number
 }
 
-export function createDemoScene({ renderer }: GpuWorkerInit, { toneMapping }: DemoSceneOptions): GpuWorkerScene {
+export function createDemoScene(
+  { renderer }: GpuWorkerInit,
+  { toneMapping, particles: particlesOption }: DemoSceneOptions,
+): GpuWorkerScene {
   renderer.toneMapping = toneMapping ? ACESFilmicToneMapping : NoToneMapping
   renderer.toneMappingExposure = 1.15
 
@@ -140,8 +148,22 @@ export function createDemoScene({ renderer }: GpuWorkerInit, { toneMapping }: De
   // ---------------------------------------------------------------
   // GPU パーティクル（ストレージバッファ + コンピュートシェーダ）
   // ---------------------------------------------------------------
-  const positions = instancedArray(PARTICLE_COUNT, 'vec3')
-  const velocities = instancedArray(PARTICLE_COUNT, 'vec3')
+  // 0 のときは compute も Sprite も作らない（計測の切り分け用）。
+  // 未指定時は従来どおり PARTICLE_COUNT。
+  const particleCount =
+    particlesOption === undefined ? PARTICLE_COUNT : Math.max(0, Math.floor(particlesOption))
+
+  if (particleCount === 0) {
+    return {
+      scene,
+      meta: { particles: 0 },
+      // 深度を書くものがないので深度パスから外すものもない
+      depthExclude: [],
+    }
+  }
+
+  const positions = instancedArray(particleCount, 'vec3')
+  const velocities = instancedArray(particleCount, 'vec3')
 
   const uTime = uniform(0)
   const uDelta = uniform(1 / 60)
@@ -167,7 +189,7 @@ export function createDemoScene({ renderer }: GpuWorkerInit, { toneMapping }: De
     velocity.assign(vec3(angle.cos().mul(0.35), r3.sub(0.5).mul(0.2), angle.sin().mul(0.35)))
   })()
   const computeInit = (initParticles as unknown as { compute: (count: number) => ComputeTask }).compute(
-    PARTICLE_COUNT,
+    particleCount,
   )
 
   const updateParticles = Fn(() => {
@@ -210,7 +232,7 @@ export function createDemoScene({ renderer }: GpuWorkerInit, { toneMapping }: De
     position.y.assign(clamp(position.y, 0.25, ROOM.height - 0.25))
   })()
   const computeUpdate = (updateParticles as unknown as { compute: (count: number) => ComputeTask }).compute(
-    PARTICLE_COUNT,
+    particleCount,
   )
 
   const particleMaterial = new SpriteNodeMaterial()
@@ -224,7 +246,7 @@ export function createDemoScene({ renderer }: GpuWorkerInit, { toneMapping }: De
   particleMaterial.depthWrite = false
 
   const particles = new Sprite(particleMaterial)
-  particles.count = PARTICLE_COUNT
+  particles.count = particleCount
   particles.frustumCulled = false
   room.add(particles)
 
@@ -232,7 +254,7 @@ export function createDemoScene({ renderer }: GpuWorkerInit, { toneMapping }: De
 
   return {
     scene,
-    meta: { particles: PARTICLE_COUNT },
+    meta: { particles: particleCount },
     // 深度を書かないもの（パーティクル）は深度パスから外す
     depthExclude: [particles],
     update: ({ time, delta, renderer: activeRenderer }) => {

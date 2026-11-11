@@ -9,10 +9,18 @@
  * 上下反転した状態で入る。使う側でサンプリング時に V を反転する。
  */
 
-import { useFrame } from '@react-three/fiber'
+import { useFrame, useThree } from '@react-three/fiber'
 import type { RootState } from '@react-three/fiber'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { LinearFilter, NearestFilter, PerspectiveCamera, Source, SRGBColorSpace, Texture } from 'three'
+import {
+  LinearFilter,
+  NearestFilter,
+  PerspectiveCamera,
+  Source,
+  SRGBColorSpace,
+  Texture,
+} from 'three'
+import type { WebGLRenderer } from 'three'
 import { normalizeDimension } from './protocol'
 import type { WorkerResponse } from './protocol'
 import type { FrameRequest, ViewMatrices } from './protocol'
@@ -24,6 +32,60 @@ import type { FrameRequest, ViewMatrices } from './protocol'
  * 描画が止まったままにならないようにするため。
  */
 const FRAME_TIMEOUT_MS = 2000
+
+/**
+ * `gl.render` の計測リスナー共有表。同じ `WebGLRenderer` に複数の計測利用者が
+ * いてもラップは 1 回だけにし、任意順の解除で壊れないようにする。
+ * 後から別のコードが `gl.render` を上書きした場合は、解除時に上書きしない
+ * （`gl.render === patched` のときだけ元に戻す）。
+ */
+interface RenderTimingEntry {
+  original: WebGLRenderer['render']
+  patched: WebGLRenderer['render']
+  listeners: Set<(ms: number) => void>
+}
+
+const renderTimingByRenderer = new WeakMap<WebGLRenderer, RenderTimingEntry>()
+
+/**
+ * `renderer.render` を 1 回だけラップして実行時間を全リスナーへ配る。
+ * 解除関数を返す。最後のリスナーが外れたら、現在の `render` がラップした
+ * ものと同じ場合だけ元に戻す。
+ */
+function addRenderTiming(renderer: WebGLRenderer, listener: (ms: number) => void): () => void {
+  let entry = renderTimingByRenderer.get(renderer)
+  if (!entry) {
+    const original = renderer.render
+    const listeners = new Set<(ms: number) => void>()
+    const patched = function (
+      this: WebGLRenderer,
+      ...args: Parameters<WebGLRenderer['render']>
+    ) {
+      const start = performance.now()
+      try {
+        return original.apply(this, args)
+      } finally {
+        const ms = performance.now() - start
+        for (const fn of listeners) fn(ms)
+      }
+    } as WebGLRenderer['render']
+    entry = { original, patched, listeners }
+    renderer.render = patched
+    renderTimingByRenderer.set(renderer, entry)
+  }
+  entry.listeners.add(listener)
+  return () => {
+    const current = renderTimingByRenderer.get(renderer)
+    if (!current) return
+    current.listeners.delete(listener)
+    if (current.listeners.size === 0) {
+      if (renderer.render === current.patched) {
+        renderer.render = current.original
+      }
+      renderTimingByRenderer.delete(renderer)
+    }
+  }
+}
 
 /** Vite の `?worker` import が返すコンストラクタ */
 export type WorkerConstructor = new () => Worker
@@ -64,10 +126,72 @@ export interface UseGpuWorkerOptions {
   /** コンソールに ready / fps を出す（既定 false） */
   debug?: boolean
   /**
+   * 区間別の計測を有効にするか（既定 false）。
+   * true のときだけ Worker に計測を指示し、テクスチャ転送とメイン描画も測って
+   * 約 1000ms ごとに `onStats` を呼ぶ。false のときは計測も追加の同期も行わない。
+   * マウント時に評価する。切り替えるには再マウントすること。
+   * @internal デモ / 開発時の計測用。公開 API ではない。
+   */
+  profile?: boolean
+  /**
+   * 計測窓ごとの集計（profile: true のときだけ呼ばれる）
+   * @internal デモ / 開発時の計測用。公開 API ではない。
+   */
+  onStats?: (stats: GpuWorkerStats) => void
+  /**
    * 深度画像も受け取る（毎フレーム 2 パス描画になる）。
    * @internal experimental/DepthComposite 専用。
    */
   internalDepth?: boolean
+}
+
+/**
+ * 約 1000ms の計測窓で平均した描画統計。
+ *
+ * - `roundTripMs` は送信→結果受信（Worker 描画 + 転送 + メッセージ往復）。
+ * - `intervalMs` はフレーム送信の間隔。Worker が詰まると `maxFps` より延びる。
+ * - `mainFrameMs` は rAF の間隔（メインスレッドの忙しさ）。
+ * - `uploadMs` は ImageBitmap→GL テクスチャ転送。`initTexture` で即時転送して測る。
+ * - `mainRenderMs` はメインの `gl.render` 呼び出し時間（背景板 + シーン全体）。
+ * - `updateMs` / `renderMs` / `snapshotMs` / `workerTotalMs` は Worker 内の JS 区間。
+ * - `gpuRenderMs` / `gpuComputeMs` は GPU 上の実時間の非同期サンプル平均
+ *   （30 フレームに 1 回だけ解決する値を窓内で平均したもので、全フレーム平均ではない）。
+ *   取れない環境では undefined。
+ *
+ * @internal デモ / 開発時の計測用。公開 API ではない。
+ */
+export interface GpuWorkerStats {
+  /** 集計窓の長さ (ms) */
+  windowMs: number
+  /** 窓内に届いた Worker 結果の数 */
+  frames: number
+  /** 背景の実効 fps（frames / windowMs * 1000） */
+  fps: number
+  /** 1 視点ぶんの解像度 */
+  width: number
+  height: number
+  /** main: 送信→結果受信の平均 (ms)。Worker 描画 + 転送 + メッセージを含む */
+  roundTripMs: number
+  /** main: フレーム送信間隔の平均 (ms) */
+  intervalMs: number
+  /** main: rAF 間隔の平均 (ms) */
+  mainFrameMs: number
+  /** main: ImageBitmap→GL テクスチャ転送の平均 (ms)。profile 時は initTexture で即時転送して測る */
+  uploadMs: number
+  /** main: gl.render の JS 時間平均 (ms)。profile 時のみ計測 */
+  mainRenderMs: number
+  /** worker: 区間平均 (ms) */
+  updateMs: number
+  renderMs: number
+  snapshotMs: number
+  workerTotalMs: number
+  /**
+   * worker: GPU 実時間の非同期サンプル平均 (ms)。
+   * 30 フレームに 1 回だけ解決する値を窓内で平均したもので、全フレーム平均ではない。
+   * 取れないときは undefined。
+   */
+  gpuRenderMs?: number
+  gpuComputeMs?: number
 }
 
 export interface UseGpuWorkerResult {
@@ -93,6 +217,36 @@ function createTexture(nearest: boolean) {
   if (!nearest) texture.colorSpace = SRGBColorSpace
   return texture
 }
+
+/** 計測窓ごとの累積値を作る（窓の切り替えごとに捨てる） */
+function createProfileAccumulator() {
+  return {
+    windowStart: performance.now(),
+    frames: 0,
+    roundTripSum: 0,
+    roundTripCount: 0,
+    prevSentAt: 0,
+    intervalSum: 0,
+    intervalCount: 0,
+    mainFrameSum: 0,
+    mainFrameCount: 0,
+    uploadSum: 0,
+    uploadCount: 0,
+    mainRenderSum: 0,
+    mainRenderCount: 0,
+    updateSum: 0,
+    renderSum: 0,
+    snapshotSum: 0,
+    workerTotalSum: 0,
+    workerCount: 0,
+    gpuRenderSum: 0,
+    gpuRenderCount: 0,
+    gpuComputeSum: 0,
+    gpuComputeCount: 0,
+  }
+}
+
+type ProfileAccumulator = ReturnType<typeof createProfileAccumulator>
 
 /**
  * テクスチャに新しい ImageBitmap を反映する。
@@ -126,6 +280,8 @@ export function useGpuWorker({
   onReady,
   onError,
   debug = false,
+  profile = false,
+  onStats,
   internalDepth = false,
 }: UseGpuWorkerOptions): UseGpuWorkerResult {
   const workerRef = useRef<Worker | null>(null)
@@ -134,9 +290,26 @@ export function useGpuWorker({
   /** 最後にフレームを送った時刻（応答待ちのタイムアウト判定用） */
   const sentAtRef = useRef(0)
   const frameIdRef = useRef(0)
-  const lastSentRef = useRef(0)
+  /** request id ごとの送信時刻（roundTrip 対応付け用。profileEnabled のときだけ記録） */
+  const sentAtByIdRef = useRef(new Map<number, number>())
+  /** 次にフレーム送信を許可する予定時刻（performance.now の ms。位相を保って間引く用） */
+  const nextSendAtRef = useRef(0)
   const lastErrorMessageRef = useRef<string | null>(null)
   const stats = useRef({ frames: 0, renderMs: 0, since: performance.now() })
+
+  // フックの順序を固定するため購読自体は常に行う。
+  // profile=false のときは参照・initTexture・ラップのいずれも行わない。
+  const glForProfile = useThree((state) => state.gl)
+
+  // `profile` はマウント時に評価する。切り替えるには再マウントすること。
+  const profileEnabled = useRef(profile).current
+  /**
+   * 計測窓ごとの累積値。profileEnabled（マウント時固定）のときだけ書き込み・読み出しする。
+   * useFrame 側で経過時間を見て emit するため、Worker が遅くて結果が来なくても出る。
+   * profile=false で `performance.now()` を読む初期化が走らないよう遅延生成する。
+   */
+  const profileStats = useRef<ProfileAccumulator | null>(null)
+  const ensureProfileStats = () => (profileStats.current ??= createProfileAccumulator())
 
   const colorPending = useRef<ImageBitmap | null>(null)
   const colorRetired = useRef<ImageBitmap | null>(null)
@@ -158,8 +331,8 @@ export function useGpuWorker({
     }
   }, [textures])
 
-  const optionsRef = useRef({ width, height, internalDepth, workerData })
-  optionsRef.current = { width, height, internalDepth, workerData }
+  const optionsRef = useRef({ width, height, internalDepth, workerData, profile: profileEnabled })
+  optionsRef.current = { width, height, internalDepth, workerData, profile: profileEnabled }
 
   const getViewCamerasRef = useRef(getViewCameras)
   getViewCamerasRef.current = getViewCameras
@@ -173,8 +346,16 @@ export function useGpuWorker({
   const debugRef = useRef(debug)
   debugRef.current = debug
 
+  // profile はマウント時に固定（profileEnabled）するため profileRef は持たない
+
+  const onStatsRef = useRef(onStats)
+  onStatsRef.current = onStats
+
   // --- Worker 起動 ---------------------------------------------------------
   useEffect(() => {
+    // maxFps 変更や Worker 起動で位相の基準を戻す（古い予定時刻を引きずらない）
+    nextSendAtRef.current = 0
+    sentAtByIdRef.current.clear()
     const worker = new WorkerClass()
     workerRef.current = worker
     readyRef.current = false
@@ -231,6 +412,36 @@ export function useGpuWorker({
       stats.current.frames++
       stats.current.renderMs += message.renderMs
 
+      // profile 時のみ送信時刻からの実測を累積する（false のときは時計も読まない）
+      if (profileEnabled) {
+        const accumulated = ensureProfileStats()
+        accumulated.frames++
+        // request id で送信時刻を対応付ける。タイムアウト後に古い結果が返っても
+        // 別リクエストの時刻で計算しない。対応がなければ加算しない。
+        const sentAt = sentAtByIdRef.current.get(message.id)
+        if (sentAt !== undefined) {
+          accumulated.roundTripSum += performance.now() - sentAt
+          accumulated.roundTripCount++
+        }
+        sentAtByIdRef.current.delete(message.id)
+        const timings = message.timings
+        if (timings) {
+          accumulated.updateSum += timings.updateMs
+          accumulated.renderSum += timings.renderMs
+          accumulated.snapshotSum += timings.snapshotMs
+          accumulated.workerTotalSum += timings.totalMs
+          accumulated.workerCount++
+          if (typeof timings.gpuRenderMs === 'number') {
+            accumulated.gpuRenderSum += timings.gpuRenderMs
+            accumulated.gpuRenderCount++
+          }
+          if (typeof timings.gpuComputeMs === 'number') {
+            accumulated.gpuComputeSum += timings.gpuComputeMs
+            accumulated.gpuComputeCount++
+          }
+        }
+      }
+
       if (debugRef.current && stats.current.frames >= 120) {
         const fps = (stats.current.frames * 1000) / (performance.now() - stats.current.since)
         console.info(
@@ -261,12 +472,13 @@ export function useGpuWorker({
       console.error('[webgpu-view] worker error:', event.message)
     }
 
-    const { width: w, height: h, internalDepth: d, workerData: data } = optionsRef.current
+    const { width: w, height: h, internalDepth: d, workerData: data, profile: p } = optionsRef.current
     worker.postMessage({
       type: 'init',
       width: normalizeDimension(w),
       height: normalizeDimension(h),
       depth: d,
+      profile: p,
       data,
     })
 
@@ -274,6 +486,7 @@ export function useGpuWorker({
       workerRef.current = null
       readyRef.current = false
       inFlightRef.current = false
+      sentAtByIdRef.current.clear()
       colorPending.current?.close()
       colorPending.current = null
       colorRetired.current?.close()
@@ -286,6 +499,11 @@ export function useGpuWorker({
     }
   }, [WorkerClass])
 
+  // maxFps が変わったら送信予定の基準を戻す（古い間隔の位相を引きずらない）
+  useEffect(() => {
+    nextSendAtRef.current = 0
+  }, [maxFps])
+
   // --- リサイズ -----------------------------------------------------------
   useEffect(() => {
     workerRef.current?.postMessage({
@@ -295,6 +513,21 @@ export function useGpuWorker({
     })
   }, [width, height])
 
+  // --- メイン描画の計測（profileEnabled のときだけ gl.render を包む） -------------
+  // XR 中も r3f は同じ gl.render 経路で描くため、そのまま測れる。
+  // profile はマウント時固定なので切り替え時の取り直しは不要。
+  // addRenderTiming で参照カウントし、任意順の解除でも壊れないようにする。
+  useEffect(() => {
+    if (!profileEnabled) return
+    return addRenderTiming(glForProfile, (ms) => {
+      // 集計オブジェクトがまだ無い（初回計測前）ときは無視する
+      const accumulated = profileStats.current
+      if (!accumulated) return
+      accumulated.mainRenderSum += ms
+      accumulated.mainRenderCount++
+    })
+  }, [profileEnabled, glForProfile])
+
   // --- 毎フレーム: テクスチャ更新 + カメラ送信 -----------------------------
   useFrame((state, delta) => {
     const { color, depth: depthTexture } = textures
@@ -303,6 +536,15 @@ export function useGpuWorker({
     if (colorBitmap) {
       colorPending.current = null
       updateTexture(color, colorBitmap)
+
+      // profile 時のみ即時転送して時間を測る（通常は描画時にまかせて触らない）
+      if (profileEnabled) {
+        const uploadStart = performance.now()
+        glForProfile.initTexture(color)
+        const accumulated = ensureProfileStats()
+        accumulated.uploadSum += performance.now() - uploadStart
+        accumulated.uploadCount++
+      }
 
       // 前回の bitmap はこのフレームで転送済みなので解放してよい
       colorRetired.current?.close()
@@ -320,6 +562,45 @@ export function useGpuWorker({
       depthRetired.current = depthBitmap
     }
 
+    // profile 時は結果が来なくても窓の経過で emit する（Worker 停滞の切り分け用）
+    if (profileEnabled) {
+      const accumulated = ensureProfileStats()
+      accumulated.mainFrameSum += delta * 1000
+      accumulated.mainFrameCount++
+      const now = performance.now()
+      const windowMs = now - accumulated.windowStart
+      if (windowMs >= 1000) {
+        const { width: w, height: h } = optionsRef.current
+        const avg = (sum: number, count: number) => (count > 0 ? sum / count : 0)
+        onStatsRef.current?.({
+          windowMs,
+          frames: accumulated.frames,
+          fps: (accumulated.frames * 1000) / windowMs,
+          width: w,
+          height: h,
+          roundTripMs: avg(accumulated.roundTripSum, accumulated.roundTripCount),
+          intervalMs: avg(accumulated.intervalSum, accumulated.intervalCount),
+          mainFrameMs: avg(accumulated.mainFrameSum, accumulated.mainFrameCount),
+          uploadMs: avg(accumulated.uploadSum, accumulated.uploadCount),
+          mainRenderMs: avg(accumulated.mainRenderSum, accumulated.mainRenderCount),
+          updateMs: avg(accumulated.updateSum, accumulated.workerCount),
+          renderMs: avg(accumulated.renderSum, accumulated.workerCount),
+          snapshotMs: avg(accumulated.snapshotSum, accumulated.workerCount),
+          workerTotalMs: avg(accumulated.workerTotalSum, accumulated.workerCount),
+          gpuRenderMs:
+            accumulated.gpuRenderCount > 0
+              ? accumulated.gpuRenderSum / accumulated.gpuRenderCount
+              : undefined,
+          gpuComputeMs:
+            accumulated.gpuComputeCount > 0
+              ? accumulated.gpuComputeSum / accumulated.gpuComputeCount
+              : undefined,
+        })
+        const keptPrevSentAt = accumulated.prevSentAt
+        profileStats.current = { ...createProfileAccumulator(), windowStart: now, prevSentAt: keptPrevSentAt }
+      }
+    }
+
     if (!enabled || !readyRef.current) return
 
     if (inFlightRef.current) {
@@ -331,9 +612,20 @@ export function useGpuWorker({
       }
     }
 
+    // maxFps が 0 以下 / 非有限のときは送らない。NaN の誤送信を避けるため先に確認する
+    if (!Number.isFinite(maxFps) || maxFps <= 0) return
+    const intervalMs = 1000 / maxFps
+    // Number.MIN_VALUE のような極小値では intervalMs が Infinity になるため弾く
+    if (!Number.isFinite(intervalMs)) return
+    const nowMs = performance.now()
+    // 予定時刻より前なら送らない。+1ms は rAF の量子化（16.67ms と 1/60 の差）の許容。
+    if (nowMs + 1 < nextSendAtRef.current) return
+    // 次回の予定は「前回の予定 + 間隔」。ジッタで遅れた分は次以降で回収し、
+    // タブ非表示などで大きく遅れたときは now を下限にして burst しない。
+    nextSendAtRef.current = Math.max(nextSendAtRef.current + intervalMs, nowMs)
+
+    // Worker に送るアニメーション時間は従来どおり clock を使う
     const time = state.clock.elapsedTime
-    if (time - lastSentRef.current < 1 / maxFps) return
-    lastSentRef.current = time
 
     const getViews = getViewCamerasRef.current
     const viewCameras = getViews ? getViews(state) : [(state.camera as PerspectiveCamera)]
@@ -362,6 +654,21 @@ export function useGpuWorker({
 
     inFlightRef.current = true
     sentAtRef.current = performance.now()
+    if (profileEnabled) {
+      const accumulated = ensureProfileStats()
+      if (accumulated.prevSentAt > 0) {
+        accumulated.intervalSum += sentAtRef.current - accumulated.prevSentAt
+        accumulated.intervalCount++
+      }
+      accumulated.prevSentAt = sentAtRef.current
+      // request id で送信時刻を対応付ける（上限 8 件を超えたら最古から捨てる）
+      const sentAtById = sentAtByIdRef.current
+      sentAtById.set(message.id, sentAtRef.current)
+      if (sentAtById.size > 8) {
+        const oldest = sentAtById.keys().next()
+        if (!oldest.done) sentAtById.delete(oldest.value)
+      }
+    }
     workerRef.current?.postMessage(message)
   })
 

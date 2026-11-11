@@ -27,7 +27,7 @@ import {
   Vector3,
 } from 'three'
 import { useGpuWorker } from './useGpuWorker'
-import type { GpuWorkerReadyInfo, WorkerConstructor } from './useGpuWorker'
+import type { GpuWorkerReadyInfo, GpuWorkerStats, WorkerConstructor } from './useGpuWorker'
 
 /** シーンより先に描くための renderOrder（背景） */
 const BACKDROP_RENDER_ORDER = -1000
@@ -111,6 +111,19 @@ export interface GpuBackdropProps {
   onError?: (message: string) => void
   /** コンソールに ready / fps を出す */
   debug?: boolean
+  /**
+   * 区間別の計測を有効にするか（既定 false）。
+   * true のときだけ Worker・転送・メイン描画の時間を測り、
+   * 約 1000ms ごとに `onStats` を呼ぶ。false のときは何も変えない。
+   * マウント時に評価する。切り替えるには再マウントすること。
+   * @internal デモ / 開発時の計測用。公開 API ではない。
+   */
+  profile?: boolean
+  /**
+   * 計測窓ごとの集計（profile: true のときだけ呼ばれる）
+   * @internal デモ / 開発時の計測用。公開 API ではない。
+   */
+  onStats?: (stats: GpuWorkerStats) => void
 }
 
 export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
@@ -125,6 +138,8 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
   onReady,
   onError,
   debug = false,
+  profile = false,
+  onStats,
 }) => {
   const gl = useThree((state) => state.gl)
   const size = useThree((state) => state.size)
@@ -209,6 +224,8 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
     onReady,
     onError,
     debug,
+    profile,
+    onStats,
   })
 
   // --- 背景の板ポリ ---------------------------------------------------------
