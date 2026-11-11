@@ -278,3 +278,44 @@ Vite の HMR が乱れて画面が真っ白になることがある。そのと�
 
 `dist` は `index.js`（メイン）/ `worker/index.js`（Worker）/ `experimental/index.js`（実験）の
 3 エントリ。`react` / `three` / `@react-three/fiber` は external。
+
+## リリース（npm publish）
+
+`v*` タグの push で `.github/workflows/publish.yml` が走り、npm へ publish する。
+認証は **Trusted Publishing（OIDC）** で、長期トークンは使わない（provenance も自動）。
+
+```bash
+# 1. バージョンを上げる（コミットと vX.Y.Z タグも作られる）
+npm version patch     # 例: 0.1.0 -> 0.1.1（minor / major も同じ）
+
+# 2. タグごと push（タグ push が publish のトリガー）
+git push --follow-tags
+```
+
+ワークフローは次を確認してから publish する。
+
+- タグ名（`v` を除く）と `package.json` の `version` が一致すること
+- `npm run typecheck` / `npm run build` が通ること
+
+### 初回だけ必要な設定（npmjs.com）
+
+パッケージの Settings > **Trusted publishing** > GitHub Actions に登録する。
+
+| 項目 | 値 |
+| --- | --- |
+| Organization or user | `WebXR-JP` |
+| Repository | `xrift-webgpu-view` |
+| Workflow filename | `publish.yml`（パスではなくファイル名） |
+| Environment name | 空でよい |
+| Allowed actions | **`npm publish` を許可する** |
+
+- 「Allowed actions」は 2026-09-03 以降に作った設定では既定が `npm stage publish` のみで、
+  `npm publish` は無効。チェックを入れないと publish で失敗する。
+- 設定は最初の publish が成功して初めて有効になる。**作成から 2 日以内**にタグを push すること
+  （過ぎると設定が失効し、作り直しになる）。
+- 登録内容は保存時に検証されない。workflow 名・リポジトリ名の typo は publish 時に
+  `ENEEDAUTH` として出る。`package.json` の `repository.url` と GitHub のリポジトリが
+  一致している必要がある。
+
+トークン方式（`NPM_TOKEN`）は使わない。CI からの公開は trusted publishing に一本化する。
+

@@ -1,0 +1,65 @@
+# v* タグの push で npm へ publish する
+#
+# 認証は npm の Trusted Publishing（OIDC）。NPM_TOKEN などの長期トークンは使わない。
+#
+# 事前準備（npmjs.com で 1 回だけ）:
+#   パッケージ Settings > Trusted publishing > GitHub Actions
+#     Organization or user: WebXR-JP
+#     Repository:           xrift-webgpu-view
+#     Workflow filename:    publish.yml
+#     Allowed actions:      npm publish（許可されていないと publish で失敗する）
+#
+# リリース手順:
+#   npm version patch        # package.json / lock の更新 + コミット + vX.Y.Z タグ
+#   git push --follow-tags   # タグ push でこのワークフローが走る
+
+name: Publish
+
+# YAML 1.1 のパーサが `on` を真偽値として読むのを避けるためクォートする
+"on":
+  push:
+    tags:
+      - 'v*'
+
+# 同じタグで二重に publish しない
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # OIDC（Trusted Publishing）と provenance に必須
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          # Trusted Publishing には npm 11.5.1+ / Node 22.14+ が必要
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          # リリースビルドではキャッシュを使わない（npm の推奨）
+          package-manager-cache: false
+
+      - name: タグと package.json の version を照合
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p "require('./package.json').version")"
+          echo "tag=${tag} version=${version}"
+          if [ "${tag}" != "${version}" ]; then
+            echo "::error::タグ ${GITHUB_REF_NAME} と package.json の version ${version} が一致しません"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      # OIDC で認証される（provenance も自動で付く）
+      - run: npm publish

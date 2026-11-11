@@ -65,3 +65,19 @@ cd examples/world && npx xrift check world     # セキュリティチェック�
 ```
 
 XR は実機（PICO 4 など）が必要。未検証の経路を触ったら、その旨をコミットメッセージに書く。
+
+## リリース
+
+npm への公開は **`v*` タグの push** でのみ行う（`.github/workflows/publish.yml`）。
+`npm publish` を手元で叩かない（タグとバージョンの一致・provenance が CI 側で担保される）。
+
+認証は **Trusted Publishing（OIDC）**。`NPM_TOKEN` などのトークンは使わない。
+npmjs.com のパッケージ Settings > Trusted publishing で
+`WebXR-JP` / `xrift-webgpu-view` / `publish.yml` を登録し、**`npm publish` を許可**しておく
+（既定は `npm stage publish` のみ）。設定は最初の publish から 2 日で失効するので、
+作成したらすぐタグを push する。
+
+```bash
+npm version patch      # package.json / lock 更新 + コミット + vX.Y.Z タグ
+git push --follow-tags # タグ push が publish のトリガー
+```
