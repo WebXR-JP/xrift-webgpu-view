@@ -114,8 +114,56 @@ export const World = () => (
 | `enabled` | `true` | `false` で停止（背景が消える） |
 | `stereo` | `false` | モニタでも 2 視点（SBS）。XR 中は自動で 2 視点 |
 | `eyeSeparation` | `0.064` | SBS の眼間距離（m） |
-| `onReady` / `onError` | — | `{ backend, adapter, width, height, meta }` / エラーメッセージ |
+| `transfer` | 自動判定 | 描画結果の受け渡し経路（`'bitmap'` / `'buffer'` / 選択関数）。未指定なら `selectTransferMode`。下記参照 |
+| `onReady` / `onError` | — | `{ backend, adapter, width, height, transfer, meta }` / エラーメッセージ |
 | `debug` | `false` | コンソールに ready と fps を出す |
+
+### 受け渡し経路（`transfer`）
+
+Worker で描いた絵をメインスレッドへ渡す方法は 2 つある。
+
+| 経路 | 流れ | 向いている環境 |
+| --- | --- | --- |
+| `'bitmap'` | canvas → `transferToImageBitmap()` → ImageBitmap を transfer → メインでテクスチャにアップロード | UMA（Apple Silicon など）やディスクリート GPU。GPU 上のコピーで済む |
+| `'buffer'` | RenderTarget → `copyTextureToBuffer` で RGBA8 を読み戻し → ArrayBuffer を transfer → メインで `texSubImage2D(Uint8Array)` | ImageBitmap のアップロードが重い実装（Safari は 1280×833 で 18ms 対 0.4ms の実測差）。GPU→CPU の読み戻しが安い環境 |
+
+`'buffer'` は GPU→CPU の読み戻しが入るため、**非 UMA（ディスクリート GPU）では PCIe 経由になって不利**になりうる。
+そのため未指定のときは `selectTransferMode` が次の順で選ぶ。
+
+1. ディスクリート GPU（GeForce / RTX / Radeon RX・Pro / Arc A770 など）→ `'bitmap'`
+2. Blink の Chromium（Chrome / Edge / Opera / Samsung Internet）→ `'bitmap'`
+3. それ以外（Safari / Firefox など）→ `'buffer'`
+
+```tsx
+// 既定の判定に任せる
+<GpuBackdrop worker={MyWorker} />
+
+// 固定
+<GpuBackdrop worker={MyWorker} transfer="buffer" />
+
+// 自前の判定で上書き（マウント時に 1 回だけ呼ばれる）
+<GpuBackdrop
+  worker={MyWorker}
+  transfer={({ renderer, userAgent }) => {
+    if (/Apple M\d|Apple GPU/.test(renderer)) return 'buffer'
+    return 'bitmap'
+  }}
+/>
+```
+
+`selectTransferMode` と型は `@webxr-jp/webgpu-view` から import できる。
+
+```ts
+import { selectTransferMode } from '@webxr-jp/webgpu-view'
+```
+
+`transfer` に渡る情報は `{ width, height, renderer, userAgent }`（`renderer` はメインスレッドの
+WebGL レンダラ名）。判定は文字列のヒューリスティックなので、外れる環境では自前の関数で上書きする。
+`internalDepth: true`（`DepthComposite`）のときは `'bitmap'` に固定される。
+
+> `buffer` 経路は RenderTarget に描くが、three の `setOutputRenderTarget()` で
+> canvas と同じトーンマップ + 出力色空間の変換を掛けているため、色は `bitmap` 経路と一致する
+> （デモの静止画で比較してピクセル差は 0.01% 未満、残りはアニメーション由来）。
 
 ### `defineGpuWorker(factory)`
 

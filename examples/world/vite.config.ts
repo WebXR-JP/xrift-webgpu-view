@@ -1,4 +1,5 @@
 import react from '@vitejs/plugin-react'
+import basicSsl from '@vitejs/plugin-basic-ssl'
 import path from 'path'
 import { defineConfig } from 'vite'
 import dts from 'vite-plugin-dts'
@@ -7,6 +8,10 @@ import { xriftDev } from '@xrift/sdk/vite'
 
 export default defineConfig({
   plugins: [
+    // iPad / 実機では WebGPU が secure context でしか使えないため、
+    // dev サーバーも HTTPS で配信する（`npm run dev -- --host` で LAN から開く）。
+    // 自己署名証明書なので、実機では警告を一度許可する。
+    basicSsl(),
     react(),
     // <Item itemId> をローカルでも本番と同じバンドルで動かすための中継（要 xrift login）
     xriftDev(),

@@ -13,17 +13,24 @@ import { useFrame, useThree } from '@react-three/fiber'
 import type { RootState } from '@react-three/fiber'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  DataTexture,
   LinearFilter,
   NearestFilter,
   PerspectiveCamera,
+  RGBAFormat,
   Source,
   SRGBColorSpace,
   Texture,
+  UnsignedByteType,
 } from 'three'
 import type { WebGLRenderer } from 'three'
 import { normalizeDimension } from './protocol'
-import type { WorkerResponse } from './protocol'
+import type { TransferMode, WorkerResponse } from './protocol'
 import type { FrameRequest, ViewMatrices } from './protocol'
+import { selectTransferMode } from './transfer'
+import type { TransferContext, TransferSelector } from './transfer'
+
+export type { TransferMode } from './protocol'
 
 /**
  * Worker から結果が返らないまま待つ上限（ms）。
@@ -98,9 +105,17 @@ export interface GpuWorkerReadyInfo {
   backend: string
   /** アダプタ情報（取れない環境では空文字） */
   adapter: string
+  /** 実際に使っている受け渡し経路 */
+  transfer?: TransferMode
   /** シーン側が返した任意の情報 */
   meta?: Record<string, unknown>
 }
+
+/**
+ * 経路選択に渡す情報。マウント時に 1 回だけ評価する。
+ * 既定の判定は `selectTransferMode`（`@webxr-jp/webgpu-view` から import できる）。
+ */
+export type { TransferContext, TransferSelector } from './transfer'
 
 export interface UseGpuWorkerOptions {
   /** `import MyWorker from './my.worker.ts?worker'` の既定エクスポート */
@@ -126,9 +141,26 @@ export interface UseGpuWorkerOptions {
   /** コンソールに ready / fps を出す（既定 false） */
   debug?: boolean
   /**
+   * 背景画像の受け渡し経路。
+   *
+   * - 未指定: `selectTransferMode` の既定判定を使う
+   *   （ディスクリート GPU と Blink の Chromium は `'bitmap'`、それ以外は `'buffer'`）。
+   * - `'bitmap'`: Worker の canvas を `transferToImageBitmap()` して ImageBitmap を transfer。
+   *   GPU 上のコピーで済むため、UMA 環境やディスクリート GPU では有利。
+   * - `'buffer'`: RenderTarget から RGBA8 を読み戻して ArrayBuffer を transfer。
+   *   GPU→CPU の読み戻しは Worker 側の非同期処理になり、メインスレッドは
+   *   `texSubImage2D(Uint8Array)` だけになる（Safari の ImageBitmap 経路が重い環境向け）。
+   * - 関数を渡すと、環境（WebGL レンダラ名 / UA / サイズ）を見て選べる。マウント時に 1 回だけ評価する。
+   *
+   * `internalDepth: true`（DepthComposite）のときは 'bitmap' に固定される。
+   */
+  transfer?: TransferMode | TransferSelector
+  /**
    * 区間別の計測を有効にするか（既定 false）。
-   * true のときだけ Worker に計測を指示し、テクスチャ転送とメイン描画も測って
-   * 約 1000ms ごとに `onStats` を呼ぶ。false のときは計測も追加の同期も行わない。
+   * true のときだけ Worker に計測を指示し、メイン描画も測って
+   * 約 1000ms ごとに `onStats` を呼ぶ。
+   * 描画経路（テクスチャ転送のタイミングなど）は変えない。
+   * false のときは計測も余計な処理も行わない。
    * マウント時に評価する。切り替えるには再マウントすること。
    * @internal デモ / 開発時の計測用。公開 API ではない。
    */
@@ -151,8 +183,8 @@ export interface UseGpuWorkerOptions {
  * - `roundTripMs` は送信→結果受信（Worker 描画 + 転送 + メッセージ往復）。
  * - `intervalMs` はフレーム送信の間隔。Worker が詰まると `maxFps` より延びる。
  * - `mainFrameMs` は rAF の間隔（メインスレッドの忙しさ）。
- * - `uploadMs` は ImageBitmap→GL テクスチャ転送。`initTexture` で即時転送して測る。
- * - `mainRenderMs` はメインの `gl.render` 呼び出し時間（背景板 + シーン全体）。
+ * - `mainRenderMs` はメインの `gl.render` 呼び出し時間。
+ *   ImageBitmap のテクスチャ転送は描画時に行われるので、これに含まれる。
  * - `updateMs` / `renderMs` / `snapshotMs` / `workerTotalMs` は Worker 内の JS 区間。
  * - `gpuRenderMs` / `gpuComputeMs` は GPU 上の実時間の非同期サンプル平均
  *   （30 フレームに 1 回だけ解決する値を窓内で平均したもので、全フレーム平均ではない）。
@@ -176,9 +208,10 @@ export interface GpuWorkerStats {
   intervalMs: number
   /** main: rAF 間隔の平均 (ms) */
   mainFrameMs: number
-  /** main: ImageBitmap→GL テクスチャ転送の平均 (ms)。profile 時は initTexture で即時転送して測る */
-  uploadMs: number
-  /** main: gl.render の JS 時間平均 (ms)。profile 時のみ計測 */
+  /**
+   * main: gl.render の JS 時間平均 (ms)。profile 時のみ計測。
+   * ImageBitmap→GL テクスチャの転送は描画時に行われるので、この値に含まれる。
+   */
   mainRenderMs: number
   /** worker: 区間平均 (ms) */
   updateMs: number
@@ -218,6 +251,56 @@ function createTexture(nearest: boolean) {
   return texture
 }
 
+/** buffer 経路の受け皿（RGBA8 / sRGB をそのまま受け取る） */
+function createBufferTexture(width: number, height: number) {
+  const w = Math.max(1, Math.round(width))
+  const h = Math.max(1, Math.round(height))
+  const texture = new DataTexture(new Uint8Array(w * h * 4), w, h, RGBAFormat, UnsignedByteType)
+  texture.colorSpace = SRGBColorSpace
+  texture.flipY = false
+  texture.generateMipmaps = false
+  texture.minFilter = LinearFilter
+  texture.magFilter = LinearFilter
+  texture.needsUpdate = true
+  return texture
+}
+
+/**
+ * buffer 経路のテクスチャを新しいフレームで更新する。
+ * サイズが変わったら、転送元の領域を作り直す（ImageBitmap 経路と同じ理由）。
+ */
+function updateBufferTexture(
+  texture: DataTexture,
+  buffer: ArrayBuffer,
+  width: number,
+  height: number,
+) {
+  const data = new Uint8Array(buffer)
+  const image = texture.image as { data: Uint8Array; width: number; height: number }
+  if (image.width !== width || image.height !== height) {
+    texture.dispose()
+    texture.image = { data, width, height }
+  } else {
+    image.data = data
+  }
+  texture.needsUpdate = true
+}
+
+/** メインスレッドの WebGL レンダラ名（取れない環境では空文字） */
+function getRendererName(gl: WebGLRenderer) {
+  try {
+    const context = gl.getContext()
+    const extension = context.getExtension('WEBGL_debug_renderer_info')
+    return String(
+      extension
+        ? context.getParameter(extension.UNMASKED_RENDERER_WEBGL)
+        : context.getParameter(context.RENDERER),
+    )
+  } catch {
+    return ''
+  }
+}
+
 /** 計測窓ごとの累積値を作る（窓の切り替えごとに捨てる） */
 function createProfileAccumulator() {
   return {
@@ -230,8 +313,6 @@ function createProfileAccumulator() {
     intervalCount: 0,
     mainFrameSum: 0,
     mainFrameCount: 0,
-    uploadSum: 0,
-    uploadCount: 0,
     mainRenderSum: 0,
     mainRenderCount: 0,
     updateSum: 0,
@@ -283,6 +364,7 @@ export function useGpuWorker({
   profile = false,
   onStats,
   internalDepth = false,
+  transfer,
 }: UseGpuWorkerOptions): UseGpuWorkerResult {
   const workerRef = useRef<Worker | null>(null)
   const readyRef = useRef(false)
@@ -298,8 +380,28 @@ export function useGpuWorker({
   const stats = useRef({ frames: 0, renderMs: 0, since: performance.now() })
 
   // フックの順序を固定するため購読自体は常に行う。
-  // profile=false のときは参照・initTexture・ラップのいずれも行わない。
+  // profile=false のときは参照・ラップのいずれも行わない。
   const glForProfile = useThree((state) => state.gl)
+
+  /**
+   * 受け渡し経路はマウント時に 1 回だけ決める。
+   * 関数が渡されたときは、環境（WebGL レンダラ名 / UA / 初期サイズ）を見て選ばせる。
+   */
+  const transferMode = useRef<TransferMode | null>(null)
+  if (transferMode.current === null) {
+    const context: TransferContext = {
+      width,
+      height,
+      renderer: getRendererName(glForProfile),
+      userAgent: typeof navigator === 'undefined' ? '' : navigator.userAgent,
+    }
+    // 未指定なら既定の判定（dGPU / Blink は bitmap、それ以外は buffer）
+    const requested =
+      typeof transfer === 'string' ? transfer : (transfer ?? selectTransferMode)(context)
+    // 深度パス（DepthComposite）は canvas の内容を読むので bitmap 固定
+    transferMode.current = !internalDepth && requested === 'buffer' ? 'buffer' : 'bitmap'
+  }
+  const bufferTransfer = transferMode.current === 'buffer'
 
   // `profile` はマウント時に評価する。切り替えるには再マウントすること。
   const profileEnabled = useRef(profile).current
@@ -313,6 +415,12 @@ export function useGpuWorker({
 
   const colorPending = useRef<ImageBitmap | null>(null)
   const colorRetired = useRef<ImageBitmap | null>(null)
+  /** buffer 経路で受け取ったフレーム（次の useFrame でテクスチャに反映する） */
+  const bufferPending = useRef<{
+    buffer: ArrayBuffer
+    width: number
+    height: number
+  } | null>(null)
   const depthPending = useRef<ImageBitmap | null>(null)
   const depthRetired = useRef<ImageBitmap | null>(null)
 
@@ -320,7 +428,12 @@ export function useGpuWorker({
   const [error, setError] = useState<string | null>(null)
 
   const textures = useMemo(
-    () => ({ color: createTexture(false), depth: internalDepth ? createTexture(true) : null }),
+    () => ({
+      color: bufferTransfer
+        ? createBufferTexture(width, height)
+        : createTexture(false),
+      depth: internalDepth ? createTexture(true) : null,
+    }),
     [internalDepth],
   )
 
@@ -372,11 +485,12 @@ export function useGpuWorker({
           height: message.height,
           backend: message.backend,
           adapter: message.adapter,
+          transfer: message.transfer,
           meta: message.meta,
         })
         if (debugRef.current) {
           console.info(
-            `[webgpu-view] ready: ${message.backend} ${message.adapter} / ${message.width}x${message.height}`,
+            `[webgpu-view] ready: ${message.backend} ${message.adapter} / ${message.width}x${message.height} / transfer ${message.transfer ?? 'bitmap'}`,
             message.meta ?? '',
           )
         }
@@ -452,11 +566,19 @@ export function useGpuWorker({
         stats.current = { frames: 0, renderMs: 0, since: performance.now() }
       }
 
-      // 未反映の bitmap は捨てる（最新のみ表示）
-      colorPending.current?.close()
-      colorPending.current = message.bitmap
+      // 未反映のフレームは捨てる（最新のみ表示）
+      if ('buffer' in message) {
+        bufferPending.current = {
+          buffer: message.buffer,
+          width: message.width,
+          height: message.height,
+        }
+      } else {
+        colorPending.current?.close()
+        colorPending.current = message.bitmap
+      }
 
-      if (message.depthBitmap) {
+      if ('depthBitmap' in message && message.depthBitmap) {
         depthPending.current?.close()
         depthPending.current = message.depthBitmap
       }
@@ -479,6 +601,7 @@ export function useGpuWorker({
       height: normalizeDimension(h),
       depth: d,
       profile: p,
+      transfer: transferMode.current ?? 'bitmap',
       data,
     })
 
@@ -491,6 +614,7 @@ export function useGpuWorker({
       colorPending.current = null
       colorRetired.current?.close()
       colorRetired.current = null
+      bufferPending.current = null
       depthPending.current?.close()
       depthPending.current = null
       depthRetired.current?.close()
@@ -532,25 +656,25 @@ export function useGpuWorker({
   useFrame((state, delta) => {
     const { color, depth: depthTexture } = textures
 
-    const colorBitmap = colorPending.current
-    if (colorBitmap) {
-      colorPending.current = null
-      updateTexture(color, colorBitmap)
-
-      // profile 時のみ即時転送して時間を測る（通常は描画時にまかせて触らない）
-      if (profileEnabled) {
-        const uploadStart = performance.now()
-        glForProfile.initTexture(color)
-        const accumulated = ensureProfileStats()
-        accumulated.uploadSum += performance.now() - uploadStart
-        accumulated.uploadCount++
+    if (bufferTransfer) {
+      const pending = bufferPending.current
+      if (pending) {
+        bufferPending.current = null
+        updateBufferTexture(color as DataTexture, pending.buffer, pending.width, pending.height)
+        if (!hasFrame) setHasFrame(true)
       }
+    } else {
+      const colorBitmap = colorPending.current
+      if (colorBitmap) {
+        colorPending.current = null
+        updateTexture(color, colorBitmap)
 
-      // 前回の bitmap はこのフレームで転送済みなので解放してよい
-      colorRetired.current?.close()
-      colorRetired.current = colorBitmap
+        // 前回の bitmap はこのフレームで転送済みなので解放してよい
+        colorRetired.current?.close()
+        colorRetired.current = colorBitmap
 
-      if (!hasFrame) setHasFrame(true)
+        if (!hasFrame) setHasFrame(true)
+      }
     }
 
     const depthBitmap = depthPending.current
@@ -581,7 +705,6 @@ export function useGpuWorker({
           roundTripMs: avg(accumulated.roundTripSum, accumulated.roundTripCount),
           intervalMs: avg(accumulated.intervalSum, accumulated.intervalCount),
           mainFrameMs: avg(accumulated.mainFrameSum, accumulated.mainFrameCount),
-          uploadMs: avg(accumulated.uploadSum, accumulated.uploadCount),
           mainRenderMs: avg(accumulated.mainRenderSum, accumulated.mainRenderCount),
           updateMs: avg(accumulated.updateSum, accumulated.workerCount),
           renderMs: avg(accumulated.renderSum, accumulated.workerCount),

@@ -8,6 +8,7 @@
 import { DevEnvironment, XRiftProvider } from '@xrift/world-components'
 import type { CameraConfig, PhysicsConfig } from '@xrift/world-components'
 import { createRoot } from 'react-dom/client'
+import { DebugHud } from './components/DebugHud'
 import { World } from './World'
 import xriftConfig from '../xrift.json'
 
@@ -29,5 +30,7 @@ createRoot(rootElement).render(
     >
       <World />
     </DevEnvironment>
+    {/* 実機で「固まったのか」を画面だけで切り分けるための開発用 HUD */}
+    {new URLSearchParams(window.location.search).get('debug') === '1' ? <DebugHud /> : null}
   </XRiftProvider>,
 )

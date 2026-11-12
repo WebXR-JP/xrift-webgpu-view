@@ -91,12 +91,13 @@ xrift-webgpu-view/            # リポジトリ = npm パッケージ
 
 ```bash
 # リポジトリ直下から
-npm run example:dev    # ライブラリをビルドして開発サーバー起動 (http://localhost:5173)
+npm run example:dev    # ライブラリをビルドして開発サーバー起動 (https://localhost:5173)
 npm run example:build  # ワールドの本番ビルド
 npm run check          # 本体 + ワールドの型チェックとビルド
 
 # examples/world 内で（predev / prebuild がライブラリを自動ビルドする）
-npm run dev        # 開発サーバー起動 (http://localhost:5173)
+npm run dev        # 開発サーバー起動 (https://localhost:5173)
+npm run dev -- --host  # LAN の実機（iPad など）から開く
 npm run build      # 本番ビルド
 npm run typecheck  # 型チェック
 
@@ -107,6 +108,28 @@ xrift upload       # アップロード（xrift.json から自動判定）
 xrift whoami       # ログインユーザー確認
 xrift logout       # ログアウト
 ```
+
+---
+
+## 実機（iPad / スマホ）で開く
+
+dev サーバーは `@vitejs/plugin-basic-ssl` で HTTPS 配信する（WebGPU は secure context 必須）。
+
+```bash
+npm run dev -- --host        # https://192.168.x.x:5173/
+```
+
+- **iPad は iPadOS 26 以降でないと WebGPU が無い**。`navigator.gpu` が無いと Worker が fatal error を返し、
+  `GpuBackdrop` は `visible=false` のまま（コンソールにしか出ない）。画面は Skybox + 静止したシーンになる。
+- 証明書は自己署名（`localhost` / ループバックのみ SAN）なので、実機では警告を一度許可する。
+  `?debug=1` を付けると `[webgpu-view] ready: ...` と fps がコンソールに出る。
+- `?debug=1` で画面左上に HUD が出る（`src/components/DebugHud`・開発サーバー専用）。
+  `main` が rAF の実測、`worker` が Worker から返ってきたフレーム数、`stats` は最後の計測からの経過。
+  タブごと固まったのか / Worker だけ止まったのかを実機の画面だけで切り分けられる。
+  Worker の区間計測も見るなら `?debug=1&profile=1`。
+- 受け渡し経路は `?transfer=buffer|bitmap` で上書きできる（未指定は自動判定）。HUD の右端に実際の経路が出る。
+- `DevEnvironment` はマウス・キーボード前提（タッチの視点操作は無い）。iPad で操作するなら
+  外付けのマウス / キーボードを使うか、`xrift upload` したものを XRift 上で開く。
 
 ---
 

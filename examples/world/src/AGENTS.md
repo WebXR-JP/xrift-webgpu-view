@@ -194,6 +194,21 @@ WebGL2 には `gl_FragDepth` が無いので、**深度を「書く」ことは�
 
 ## 実装上のクセ
 
+### 転送経路（`transfer`）
+
+背景の受け渡しは 2 経路あり、`GpuBackdrop` の `transfer` で選ぶ（未指定なら `selectTransferMode` の自動判定）。
+
+- `'bitmap'`: canvas → `transferToImageBitmap()` → ImageBitmap。UMA / ディスクリート GPU 向け
+- `'buffer'`: RenderTarget → `copyTextureToBuffer` → Uint8Array。読み戻しが安い環境向け
+
+Safari (Mac, 1280×833) の実測では、テクスチャへのアップロードが
+ImageBitmap 18ms / Uint8Array 0.4ms、読み戻しが 2.25ms だった。
+
+`buffer` 経路は RenderTarget に描くため、**そのままではトーンマップも色変換も掛からない**
+（three は出力先が canvas のときだけ掛ける）。`renderer.setOutputRenderTarget(renderTarget)` で
+出力先として指定し、RT のテクスチャはリニア形式にして二重変換を避けること。
+これを忘れると背景の色がずれる。デモでは `?transfer=buffer` で切り替えられる。
+
 - `ImageBitmap` は使い終わったら `close()` する。メイン側は 1 フレーム遅らせて解放している
   （アップロード前に閉じると壊れる）。
 - **リサイズで画像サイズが変わったらテクスチャを作り直す**（`useGpuWorker` の
@@ -229,7 +244,7 @@ WebGL2 には `gl_FragDepth` が無いので、**深度を「書く」ことは�
 ```bash
 # examples/world 内で
 npm run typecheck
-npm run dev                     # http://localhost:5173（predev でライブラリもビルド）
+npm run dev                     # https://localhost:5173（predev でライブラリもビルド）
 npm run build && npx vite preview
 npx xrift check world           # 23 files APPROVE になること
 

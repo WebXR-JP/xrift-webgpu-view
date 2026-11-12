@@ -8,6 +8,19 @@
 export type Mat4 = number[]
 
 /**
+ * 背景画像の受け渡し経路。
+ *
+ * - `'bitmap'`: Worker の canvas を `transferToImageBitmap()` して ImageBitmap を transfer する。
+ *   コピーはブラウザ任せ。UMA 環境（Apple Silicon など）では安いが、
+ *   ImageBitmap → WebGL のアップロードが同期で重い実装（Safari）ではコストが大きい。
+ * - `'buffer'`: RenderTarget に描いて `copyTextureToBuffer` で RGBA8 を読み戻し、
+ *   ArrayBuffer を transfer する。GPU→CPU の読み戻しは Worker 側の非同期処理になり、
+ *   メインスレッドは `texSubImage2D(Uint8Array)` だけになる。
+ *   非 UMA（ディスクリート GPU）では読み戻しが PCIe を経由するため不利になりうる。
+ */
+export type TransferMode = 'bitmap' | 'buffer'
+
+/**
  * 1 辺の上限（px）。GPU のテクスチャ上限に合わせる。
  * アトラス（ステレオで横 2 倍）でもこの値を超えないように丸める。
  */
@@ -43,6 +56,11 @@ export interface InitRequest {
    * `FrameResponse.timings` を返す。false のときは従来どおり計測しない。
    */
   profile?: boolean
+  /**
+   * 背景画像の受け渡し経路（既定 'bitmap'）。
+   * `depth: true` のときは depth パスが canvas を使うため 'bitmap' に固定される。
+   */
+  transfer?: TransferMode
   /** シーン側へ渡す任意のデータ（structured clone できるもの） */
   data?: unknown
 }
@@ -97,6 +115,8 @@ export interface ReadyResponse {
   backend: string
   /** アダプタ情報（取れない環境では空文字） */
   adapter: string
+  /** 実際に使っている受け渡し経路 */
+  transfer?: TransferMode
   /** シーン側が返した任意の情報（パーティクル数など） */
   meta?: Record<string, unknown>
 }
@@ -139,13 +159,9 @@ export interface FrameTimings {
   gpuComputeMs?: number
 }
 
-export interface FrameResponse {
+interface FrameResponseBase {
   type: 'result'
   id: number
-  /** アトラス全体（幅 = 1 視点ぶん × 視点数） */
-  bitmap: ImageBitmap
-  /** depth: true のときだけ。R,G に 16bit 距離がパックされている */
-  depthBitmap?: ImageBitmap
   /** アトラス全体のサイズ */
   width: number
   height: number
@@ -154,5 +170,23 @@ export interface FrameResponse {
   /** 区間別の内訳（profile: true のときだけ） */
   timings?: FrameTimings
 }
+
+export interface BitmapFrameResponse extends FrameResponseBase {
+  /** アトラス全体（幅 = 1 視点ぶん × 視点数） */
+  bitmap: ImageBitmap
+  /** depth: true のときだけ。R,G に 16bit 距離がパックされている */
+  depthBitmap?: ImageBitmap
+}
+
+/**
+ * `transfer: 'buffer'` のときの結果。
+ * RGBA8（sRGB でエンコード済み）・行パディングなし・top-down のバイト列。
+ */
+export interface BufferFrameResponse extends FrameResponseBase {
+  /** `width * height * 4` バイト */
+  buffer: ArrayBuffer
+}
+
+export type FrameResponse = BitmapFrameResponse | BufferFrameResponse
 
 export type WorkerResponse = ReadyResponse | ErrorResponse | FrameResponse

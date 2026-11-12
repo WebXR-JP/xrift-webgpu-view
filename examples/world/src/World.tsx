@@ -46,10 +46,13 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
   const wallHeight = WORLD_CONFIG.wallHeight * scale
   const wallThickness = WORLD_CONFIG.wallThickness * scale
 
-  // 計測用の URL クエリ（例: ?profile=1&maxWidth=640&maxFps=30&particles=0&debug=1）
+  // 計測用の URL クエリ（例: ?profile=1&maxWidth=640&maxFps=30&particles=0&debug=1&transfer=buffer）
   const query = useMemo(() => new URLSearchParams(window.location.search), [])
   const profile = query.get('profile') === '1'
   const debugQuery = query.get('debug') === '1'
+  const transferQuery = query.get('transfer')
+  const transfer =
+    transferQuery === 'buffer' || transferQuery === 'bitmap' ? transferQuery : undefined
   const maxWidth = useMemo(() => queryNumber(query.get('maxWidth'), 1280), [query])
   const maxFps = useMemo(() => queryNumber(query.get('maxFps'), 60), [query])
   const particles = useMemo(() => queryParticles(query.get('particles')), [query])
@@ -58,6 +61,11 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
     [particles],
   )
 
+  // 実機の HUD で「どちらの経路になったか」を見られるようにする
+  const handleReady = useCallback((info: { transfer?: string }) => {
+    window.dispatchEvent(new CustomEvent('webgpu-view:ready', { detail: info }))
+  }, [])
+
   const handleStats = useCallback(
     (stats: GpuWorkerStats) => {
       // 計測結果は CustomEvent で外に出す（window への代入は
@@ -65,6 +73,15 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
       // DevTools では `addEventListener('webgpu-view:stats', (e) => ...)` で受けられる。
       window.dispatchEvent(new CustomEvent('webgpu-view:stats', { detail: stats }))
       if (debugQuery) console.info('[webgpu-view] stats', stats)
+    },
+    [debugQuery],
+  )
+
+  // ?debug=1 のときだけ、失敗理由を画面の HUD にも出す（実機はコンソールが見にくい）
+  const handleError = useCallback(
+    (message: string) => {
+      if (debugQuery) console.error('[webgpu-view]', message)
+      window.dispatchEvent(new CustomEvent('webgpu-view:error', { detail: message }))
     },
     [debugQuery],
   )
@@ -146,6 +163,9 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
           debug={debugQuery}
           profile={profile}
           onStats={handleStats}
+          onError={handleError}
+          onReady={handleReady}
+          transfer={transfer}
         />
       )}
     </>

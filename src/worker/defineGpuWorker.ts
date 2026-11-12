@@ -12,10 +12,25 @@
  * - 結果は postMessage で transfer する。ImageBitmap は受け取った側が close() する。
  */
 
-import { MeshBasicNodeMaterial, PerspectiveCamera, WebGPURenderer } from 'three/webgpu'
+import {
+  LinearFilter,
+  LinearSRGBColorSpace,
+  MeshBasicNodeMaterial,
+  PerspectiveCamera,
+  RGBAFormat,
+  RenderTarget,
+  UnsignedByteType,
+  WebGPURenderer,
+} from 'three/webgpu'
 import { clamp, positionView, sRGBTransferEOTF, vec3 } from 'three/tsl'
 import { MAX_DIMENSION, normalizeDimension } from '../protocol'
-import type { FrameRequest, ViewMatrices, WorkerRequest, WorkerResponse } from '../protocol'
+import type {
+  FrameRequest,
+  TransferMode,
+  ViewMatrices,
+  WorkerRequest,
+  WorkerResponse,
+} from '../protocol'
 import type { GpuWorkerScene, GpuWorkerSceneFactory } from './types'
 
 /** worker スコープ（tsconfig が DOM lib なので最小限を自前で宣言する） */
@@ -53,6 +68,11 @@ let viewSize = { width: 0, height: 0 }
 let initialized = false
 let busy = false
 let pending: FrameRequest | null = null
+
+/** 背景画像の受け渡し経路（init メッセージで決まる。既定は 'bitmap'） */
+let transferMode: TransferMode = 'bitmap'
+/** buffer 経路の描画先（サイズ変更のたびに作り直す） */
+let renderTarget: RenderTarget | null = null
 
 /** 深度画像も返すか（@internal） */
 let wantDepth = false
@@ -119,6 +139,23 @@ function applyCanvasSize(count: number) {
 
   renderer.setSize(totalWidth, perViewHeight, false)
   appliedSize = { width: totalWidth, height: perViewHeight }
+
+  if (transferMode === 'buffer') {
+    // 色空間は canvas 出力と同じ sRGB にしておく（メイン側でデコードし直さない）
+    renderTarget?.dispose()
+    renderTarget = new RenderTarget(totalWidth, perViewHeight, {
+      depthBuffer: true,
+      stencilBuffer: false,
+      samples: 0,
+      format: RGBAFormat,
+      type: UnsignedByteType,
+      // 出力段で sRGB へ変換するので、テクスチャ自体はリニアのままにする
+      colorSpace: LinearSRGBColorSpace,
+      minFilter: LinearFilter,
+      magFilter: LinearFilter,
+      generateMipmaps: false,
+    })
+  }
 }
 
 /** アトラス（横並び）の 1 視点分にビューポートとシザーを合わせる */
@@ -184,6 +221,82 @@ function createDepthMaterial() {
   return material
 }
 
+/** 視点ぶんのビューポートを設定して、現在の描画先（canvas / RenderTarget）へ描く */
+function renderViews(count: number) {
+  if (!renderer || !userScene) return
+  for (let i = 0; i < count; i++) {
+    applyViewport(i)
+    renderer.render(userScene.scene, getCamera(i))
+  }
+  renderer.setScissorTest(false)
+}
+
+/**
+ * `copyTextureToBuffer` の `bytesPerRow` は 256 の倍数なので、幅によっては行末に余白が入る。
+ * 転送できるよう、余白を詰めた連続したバイト列にする。
+ */
+function packRows(pixels: Uint8Array, width: number, height: number) {
+  const rowBytes = width * 4
+  const aligned = Math.ceil(rowBytes / 256) * 256
+  const packed = new Uint8Array(rowBytes * height)
+  if (pixels.byteLength === packed.byteLength) {
+    packed.set(pixels)
+  } else {
+    for (let y = 0; y < height; y++) {
+      packed.set(pixels.subarray(y * aligned, y * aligned + rowBytes), y * rowBytes)
+    }
+  }
+  return packed
+}
+
+/** three の型は null を受け付けないが、実装はそのまま代入するだけ */
+function setOutputTarget(target: RenderTarget | null) {
+  if (!renderer) return
+  ;(renderer.setOutputRenderTarget as (value: RenderTarget | null) => void)(target)
+}
+
+/**
+ * RenderTarget に全視点を描いて RGBA8 を読み戻す（buffer 経路）。
+ *
+ * 読み戻しは `mapAsync` の非同期処理なので、待っている間メインスレッドは次のフレームを描ける。
+ * 一方で GPU→CPU のコピーが入るため、非 UMA（ディスクリート GPU）では
+ * ImageBitmap 経路より遅くなりうる。経路は呼び出し側が選ぶ。
+ */
+async function renderToBuffer(count: number) {
+  if (!renderer || !userScene || !renderTarget) {
+    throw new Error('buffer 経路の RenderTarget が初期化されていません')
+  }
+
+  const renderStart = performance.now()
+  // `setOutputRenderTarget` で「出力先」として指定すると、three が canvas と同じ
+  // トーンマップ + 出力色空間の変換を掛ける（通常の RenderTarget では掛からない）。
+  // RenderTarget 側のテクスチャはリニア形式にして、変換が二重にならないようにする。
+  setOutputTarget(renderTarget)
+  renderer.setRenderTarget(renderTarget)
+  for (let i = 0; i < count; i++) {
+    applyViewport(i)
+    renderer.render(userScene.scene, getCamera(i))
+  }
+  renderer.setScissorTest(false)
+  renderer.setRenderTarget(null)
+  setOutputTarget(null)
+  const renderMs = performance.now() - renderStart
+
+  const readStart = performance.now()
+  const { width, height } = appliedSize
+  const pixels = (await renderer.readRenderTargetPixelsAsync(
+    renderTarget,
+    0,
+    0,
+    width,
+    height,
+  )) as Uint8Array
+  const packed = packRows(pixels, width, height)
+  const readMs = performance.now() - readStart
+
+  return { packed, renderMs, readMs }
+}
+
 async function renderFrame(frame: FrameRequest) {
   if (!renderer || !canvas || !userScene) return
 
@@ -202,13 +315,24 @@ async function renderFrame(frame: FrameRequest) {
 
     await userScene.update?.({ time: frame.time, delta: frame.delta, viewCount: count, renderer })
 
-    const depthBitmap = wantDepth ? await renderDepthPass(count) : null
-
-    for (let i = 0; i < count; i++) {
-      applyViewport(i)
-      renderer.render(userScene.scene, getCamera(i))
+    if (transferMode === 'buffer') {
+      const { packed } = await renderToBuffer(count)
+      scope.postMessage(
+        {
+          type: 'result',
+          id: frame.id,
+          buffer: packed.buffer as ArrayBuffer,
+          width: appliedSize.width,
+          height: appliedSize.height,
+          renderMs: performance.now() - started,
+        },
+        [packed.buffer],
+      )
+      return
     }
-    renderer.setScissorTest(false)
+
+    const depthBitmap = wantDepth ? await renderDepthPass(count) : null
+    renderViews(count)
 
     const bitmap = await snapshot(canvas)
 
@@ -240,21 +364,31 @@ async function renderFrame(frame: FrameRequest) {
   await userScene.update?.({ time: frame.time, delta: frame.delta, viewCount: count, renderer })
   const updateMs = performance.now() - updateStart
 
-  // renderMs は renderer.render() の JS 呼び出し時間（深度パスを含む）。
-  // GPU の完了待ちは含まない。
-  const renderStart = performance.now()
-  const depthBitmap = wantDepth ? await renderDepthPass(count) : null
-  for (let i = 0; i < count; i++) {
-    applyViewport(i)
-    renderer.render(userScene.scene, getCamera(i))
-  }
-  renderer.setScissorTest(false)
-  const renderMs = performance.now() - renderStart
+  let renderMs: number
+  let snapshotMs: number
+  let packed: Uint8Array | null = null
+  let bitmap: ImageBitmap | null = null
+  let depthBitmap: ImageBitmap | null = null
 
-  // snapshot は GPU 完了待ちを含みうる
-  const snapshotStart = performance.now()
-  const bitmap = await snapshot(canvas)
-  const snapshotMs = performance.now() - snapshotStart
+  if (transferMode === 'buffer') {
+    // 読み戻し（GPU→CPU）を snapshot 区間として扱う
+    const result = await renderToBuffer(count)
+    renderMs = result.renderMs
+    snapshotMs = result.readMs
+    packed = result.packed
+  } else {
+    // renderMs は renderer.render() の JS 呼び出し時間（深度パスを含む）。
+    // GPU の完了待ちは含まない。
+    const renderStart = performance.now()
+    depthBitmap = wantDepth ? await renderDepthPass(count) : null
+    renderViews(count)
+    renderMs = performance.now() - renderStart
+
+    // snapshot は GPU 完了待ちを含みうる
+    const snapshotStart = performance.now()
+    bitmap = await snapshot(canvas)
+    snapshotMs = performance.now() - snapshotStart
+  }
 
   const totalMs = performance.now() - frameStart
 
@@ -266,6 +400,33 @@ async function renderFrame(frame: FrameRequest) {
     void resolveGpuTimestamps()
   }
 
+  const timings = {
+    updateMs,
+    renderMs,
+    snapshotMs,
+    totalMs,
+    gpuRenderMs: lastGpuRenderMs,
+    gpuComputeMs: lastGpuComputeMs,
+  }
+
+  if (packed) {
+    scope.postMessage(
+      {
+        type: 'result',
+        id: frame.id,
+        buffer: packed.buffer as ArrayBuffer,
+        width: appliedSize.width,
+        height: appliedSize.height,
+        renderMs: totalMs,
+        timings,
+      },
+      [packed.buffer],
+    )
+    return
+  }
+
+  if (!bitmap) return
+
   scope.postMessage(
     {
       type: 'result',
@@ -275,14 +436,7 @@ async function renderFrame(frame: FrameRequest) {
       width: appliedSize.width,
       height: appliedSize.height,
       renderMs: totalMs,
-      timings: {
-        updateMs,
-        renderMs,
-        snapshotMs,
-        totalMs,
-        gpuRenderMs: lastGpuRenderMs,
-        gpuComputeMs: lastGpuComputeMs,
-      },
+      timings,
     },
     depthBitmap ? [bitmap, depthBitmap] : [bitmap],
   )
@@ -408,6 +562,8 @@ scope.onmessage = async (event) => {
     }
     wantDepth = message.depth === true
     profile = message.profile === true
+    // 深度パスは canvas の内容を読むので、深度ありのときは ImageBitmap 経路に固定する
+    transferMode = wantDepth ? 'bitmap' : message.transfer === 'buffer' ? 'buffer' : 'bitmap'
 
     if (initialized) return
 
@@ -420,6 +576,7 @@ scope.onmessage = async (event) => {
         height: normalizeDimension(targetSize.height),
         backend: info.backend,
         adapter: info.adapter,
+        transfer: transferMode,
         meta: userScene?.meta,
       })
     } catch (error) {
@@ -453,6 +610,8 @@ scope.onmessage = async (event) => {
     userScene = null
     depthMaterial?.dispose()
     depthMaterial = null
+    renderTarget?.dispose()
+    renderTarget = null
     renderer?.dispose()
     renderer = null
     initialized = false

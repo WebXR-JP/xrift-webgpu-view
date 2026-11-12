@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>tex upload / snapshot 計測</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: #0b0d10;
+        color: #e5e7eb;
+        font: 14px/1.6 -apple-system, system-ui, sans-serif;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 4px;
+      }
+      p.note {
+        color: #9ca3af;
+        margin: 4px 0 12px;
+      }
+      button {
+        font: 600 16px/1 system-ui, sans-serif;
+        padding: 12px 18px;
+        border: 0;
+        border-radius: 8px;
+        background: #22c55e;
+        color: #04140a;
+      }
+      button:disabled {
+        background: #374151;
+        color: #9ca3af;
+      }
+      #env {
+        white-space: pre-wrap;
+        color: #9ca3af;
+        font: 11px/1.5 ui-monospace, Menlo, monospace;
+        margin: 12px 0;
+      }
+      #status {
+        margin: 8px 0;
+        color: #fbbf24;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin-top: 8px;
+        font-variant-numeric: tabular-nums;
+      }
+      th,
+      td {
+        border-bottom: 1px solid #1f2937;
+        padding: 5px 6px;
+        text-align: left;
+      }
+      th {
+        color: #9ca3af;
+        font-weight: 600;
+        font-size: 12px;
+      }
+      td.num {
+        text-align: right;
+        font-family: ui-monospace, Menlo, monospace;
+      }
+      h2 {
+        font-size: 13px;
+        color: #9ca3af;
+        margin: 20px 0 0;
+      }
+      .warn {
+        color: #f87171;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>テクスチャ転送 / スナップショットの計測</h1>
+    <p class="note">
+      ImageBitmap 経由と Uint8Array 経由のアップロード時間、transferToImageBitmap /
+      createImageBitmap / 読み戻しの時間を比べる。数値は JS から見た時間（ms）。
+      「+finish」は gl.finish() を足して GPU 完了まで待った時間。
+    </p>
+    <button id="run">計測開始</button>
+    <div id="env"></div>
+    <div id="status"></div>
+    <div id="out"></div>
+
+    <script type="module">
+      const $ = (id) => document.getElementById(id)
+      const SIZES = [
+        [1280, 833],
+        [640, 416],
+      ]
+      const N = 20
+      const status = (text) => {
+        $('status').textContent = text
+      }
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+      function summarize(values) {
+        const a = [...values].sort((x, y) => x - y)
+        const avg = a.reduce((s, v) => s + v, 0) / a.length
+        const p95 = a[Math.min(a.length - 1, Math.floor(a.length * 0.95))]
+        return { avg, p95 }
+      }
+      const fx = (n) => n.toFixed(2)
+
+      function makeGL() {
+        const canvas = document.createElement('canvas')
+        const gl = canvas.getContext('webgl2', {
+          antialias: false,
+          alpha: false,
+          depth: false,
+          stencil: false,
+          preserveDrawingBuffer: false,
+        })
+        if (!gl) throw new Error('webgl2 が使えません')
+        return gl
+      }
+
+      function glLabel(gl) {
+        try {
+          const ext = gl.getExtension('WEBGL_debug_renderer_info')
+          return String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER))
+        } catch {
+          return ''
+        }
+      }
+
+      function makeTexture(gl, w, h, internalFormat) {
+        const tex = gl.createTexture()
+        gl.bindTexture(gl.TEXTURE_2D, tex)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+        gl.texStorage2D(gl.TEXTURE_2D, 1, internalFormat, w, h)
+        return tex
+      }
+
+      function upload(gl, tex, w, h, source) {
+        gl.bindTexture(gl.TEXTURE_2D, tex)
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, source)
+      }
+
+      // ---- WebGPU（ImageBitmap の生成元 / 読み戻しの計測用） ----------------
+      const gpuCanvases = new Map()
+      let device = null
+
+      async function getDevice() {
+        if (device) return device
+        if (!navigator.gpu) throw new Error('navigator.gpu がありません（secure context か確認）')
+        const adapter = await navigator.gpu.requestAdapter()
+        if (!adapter) throw new Error('adapter が取れません')
+        device = await adapter.requestDevice()
+        return device
+      }
+
+      function gpuCanvasFor(w, h) {
+        const key = `${w}x${h}`
+        if (gpuCanvases.has(key)) return gpuCanvases.get(key)
+        const canvas = new OffscreenCanvas(w, h)
+        const ctx = canvas.getContext('webgpu')
+        ctx.configure({
+          device,
+          format: navigator.gpu.getPreferredCanvasFormat(),
+          alphaMode: 'opaque',
+        })
+        const entry = { canvas, ctx }
+        gpuCanvases.set(key, entry)
+        return entry
+      }
+
+      function drawClear(ctx, value) {
+        const encoder = device.createCommandEncoder()
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [
+            {
+              view: ctx.getCurrentTexture().createView(),
+              loadOp: 'clear',
+              storeOp: 'store',
+              clearValue: value,
+            },
+          ],
+        })
+        pass.end()
+        device.queue.submit([encoder.finish()])
+      }
+
+      // ---- アップロード元 ---------------------------------------------------
+      const byteCache = new Map()
+
+      function getBytes(w, h) {
+        const key = `${w}x${h}`
+        if (byteCache.has(key)) return byteCache.get(key)
+        const data = new Uint8Array(w * h * 4)
+        for (let i = 0; i < data.length; i += 4) {
+          data[i] = i & 0xff
+          data[i + 1] = (i >> 8) & 0xff
+          data[i + 2] = 128
+          data[i + 3] = 255
+        }
+        byteCache.set(key, data)
+        return data
+      }
+
+      let gpuTick = 0
+      const SOURCES = {
+        async uint8(w, h) {
+          return getBytes(w, h)
+        },
+        async bitmap2d(w, h) {
+          const canvas = new OffscreenCanvas(w, h)
+          const ctx = canvas.getContext('2d')
+          ctx.fillStyle = '#3570a8'
+          ctx.fillRect(0, 0, w, h)
+          return await createImageBitmap(canvas)
+        },
+        async bitmapWebGPU(w, h) {
+          const { ctx } = gpuCanvasFor(w, h)
+          gpuTick += 1
+          drawClear(ctx, { r: (gpuTick % 10) / 10, g: 0.3, b: 0.6, a: 1 })
+          return ctx.canvas.transferToImageBitmap()
+        },
+      }
+
+      // ---- 計測 -------------------------------------------------------------
+      async function measureUpload(gl, w, h, internalFormat, kind) {
+        const tex = makeTexture(gl, w, h, internalFormat)
+        const prepare = SOURCES[kind]
+
+        for (let i = 0; i < 3; i++) {
+          const src = await prepare(w, h)
+          upload(gl, tex, w, h, src)
+          if (src && typeof src.close === 'function') src.close()
+        }
+
+        const call = []
+        for (let i = 0; i < N; i++) {
+          const src = await prepare(w, h)
+          const t0 = performance.now()
+          upload(gl, tex, w, h, src)
+          call.push(performance.now() - t0)
+          if (src && typeof src.close === 'function') src.close()
+        }
+
+        const full = []
+        for (let i = 0; i < N; i++) {
+          const src = await prepare(w, h)
+          const t0 = performance.now()
+          upload(gl, tex, w, h, src)
+          gl.finish()
+          full.push(performance.now() - t0)
+          if (src && typeof src.close === 'function') src.close()
+        }
+
+        gl.deleteTexture(tex)
+        return { call: summarize(call), full: summarize(full) }
+      }
+
+      async function measureSnapshots(device) {
+        const out = []
+        for (const [w, h] of SIZES) {
+          const size = `${w}x${h}`
+          const { canvas, ctx } = gpuCanvasFor(w, h)
+
+          // transferToImageBitmap（同期）
+          try {
+            const times = []
+            for (let i = 0; i < 3; i++) {
+              drawClear(ctx, { r: 0.2, g: 0.3, b: 0.6, a: 1 })
+              canvas.transferToImageBitmap().close()
+            }
+            for (let i = 0; i < N; i++) {
+              drawClear(ctx, { r: 0.2, g: 0.3, b: 0.6, a: 1 })
+              const t0 = performance.now()
+              const bitmap = canvas.transferToImageBitmap()
+              times.push(performance.now() - t0)
+              bitmap.close()
+            }
+            out.push({ size, method: 'transferToImageBitmap', ...summarize(times) })
+          } catch (error) {
+            out.push({ size, method: 'transferToImageBitmap', error: String(error) })
+          }
+
+          // createImageBitmap（Promise）
+          try {
+            const times = []
+            for (let i = 0; i < 3; i++) {
+              drawClear(ctx, { r: 0.2, g: 0.3, b: 0.6, a: 1 })
+              ;(await createImageBitmap(canvas)).close()
+            }
+            for (let i = 0; i < N; i++) {
+              drawClear(ctx, { r: 0.2, g: 0.3, b: 0.6, a: 1 })
+              const t0 = performance.now()
+              const bitmap = await createImageBitmap(canvas)
+              times.push(performance.now() - t0)
+              bitmap.close()
+            }
+            out.push({ size, method: 'createImageBitmap(canvas)', ...summarize(times) })
+          } catch (error) {
+            out.push({ size, method: 'createImageBitmap(canvas)', error: String(error) })
+          }
+
+          // copyTextureToBuffer + mapAsync（raw RGBA の読み戻し）
+          try {
+            const bytesPerRow = Math.ceil((w * 4) / 256) * 256
+            const texture = device.createTexture({
+              size: [w, h],
+              format: 'rgba8unorm',
+              usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+            })
+            const buffer = device.createBuffer({
+              size: bytesPerRow * h,
+              usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            })
+            const readOnce = async () => {
+              const encoder = device.createCommandEncoder()
+              const pass = encoder.beginRenderPass({
+                colorAttachments: [
+                  {
+                    view: texture.createView(),
+                    loadOp: 'clear',
+                    storeOp: 'store',
+                    clearValue: { r: 0.2, g: 0.3, b: 0.6, a: 1 },
+                  },
+                ],
+              })
+              pass.end()
+              encoder.copyTextureToBuffer(
+                { texture },
+                { buffer, bytesPerRow, rowsPerImage: h },
+                [w, h, 1],
+              )
+              device.queue.submit([encoder.finish()])
+              await buffer.mapAsync(GPUMapMode.READ)
+              const copy = new Uint8Array(buffer.getMappedRange()).slice()
+              buffer.unmap()
+              return copy
+            }
+
+            const times = []
+            for (let i = 0; i < 3; i++) await readOnce()
+            for (let i = 0; i < N; i++) {
+              const t0 = performance.now()
+              await readOnce()
+              times.push(performance.now() - t0)
+            }
+            buffer.destroy()
+            texture.destroy()
+            out.push({ size, method: 'copyTextureToBuffer+mapAsync', ...summarize(times) })
+          } catch (error) {
+            out.push({ size, method: 'copyTextureToBuffer+mapAsync', error: String(error) })
+          }
+        }
+        return out
+      }
+
+      function renderUploadTable(rows) {
+        const head = ['解像度', '形式', '転送元', '呼び出し avg', '呼び出し p95', '+finish avg', '+finish p95']
+        return (
+          `<table><thead><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>` +
+          rows
+            .map((r) =>
+              r.error
+                ? `<tr><td>${r.size}</td><td>${r.format}</td><td>${r.kind}</td>` +
+                  `<td class="warn" colspan="4">${r.error}</td></tr>`
+                : `<tr><td>${r.size}</td><td>${r.format}</td><td>${r.kind}</td>` +
+                  `<td class="num">${fx(r.call.avg)}</td><td class="num">${fx(r.call.p95)}</td>` +
+                  `<td class="num">${fx(r.full.avg)}</td><td class="num">${fx(r.full.p95)}</td></tr>`,
+            )
+            .join('') +
+          '</tbody></table>'
+        )
+      }
+
+      function renderSnapshotTable(rows) {
+        const head = ['解像度', '方法', 'avg', 'p95']
+        return (
+          `<table><thead><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>` +
+          rows
+            .map((r) =>
+              r.error
+                ? `<tr><td>${r.size}</td><td>${r.method}</td><td class="warn" colspan="2">${r.error}</td></tr>`
+                : `<tr><td>${r.size}</td><td>${r.method}</td><td class="num">${fx(r.avg)}</td><td class="num">${fx(r.p95)}</td></tr>`,
+            )
+            .join('') +
+          '</tbody></table>'
+        )
+      }
+
+      async function run() {
+        const button = $('run')
+        button.disabled = true
+        $('out').innerHTML = ''
+        try {
+          const gl = makeGL()
+          $('env').textContent = [
+            navigator.userAgent,
+            `isSecureContext=${isSecureContext}  navigator.gpu=${!!navigator.gpu}  dpr=${devicePixelRatio}`,
+            `webgl2 renderer=${glLabel(gl)}`,
+          ].join('\n')
+
+          let gpuReady = false
+          try {
+            await getDevice()
+            gpuReady = true
+          } catch (error) {
+            $('env').textContent += `\nWebGPU: ${error}`
+          }
+
+          const uploadRows = []
+          for (const [w, h] of SIZES) {
+            for (const format of ['RGBA8', 'SRGB8_ALPHA8']) {
+              const internalFormat = format === 'RGBA8' ? gl.RGBA8 : gl.SRGB8_ALPHA8
+              for (const kind of ['uint8', 'bitmap2d', 'bitmapWebGPU']) {
+                if (kind === 'bitmapWebGPU' && !gpuReady) continue
+                status(`${w}x${h} ${format} ${kind} …`)
+                await sleep(0)
+                try {
+                  const result = await measureUpload(gl, w, h, internalFormat, kind)
+                  uploadRows.push({ size: `${w}x${h}`, format, kind, ...result })
+                } catch (error) {
+                  uploadRows.push({
+                    size: `${w}x${h}`,
+                    format,
+                    kind,
+                    call: { avg: NaN, p95: NaN },
+                    full: { avg: NaN, p95: NaN },
+                    error: String(error),
+                  })
+                }
+              }
+            }
+          }
+
+          // アップロードの結果は先に出す（snapshot が失敗しても残す）
+          $('out').innerHTML =
+            '<h2>テクスチャ転送（メインスレッド）</h2>' + renderUploadTable(uploadRows)
+
+          if (gpuReady) {
+            status('snapshot 計測中 …')
+            await sleep(0)
+            try {
+              const snapshotRows = await measureSnapshots(device)
+              if (snapshotRows.length > 0) {
+                $('out').innerHTML +=
+                  '<h2>スナップショット / 読み戻し（WebGPU）</h2>' + renderSnapshotTable(snapshotRows)
+              }
+            } catch (error) {
+              $('out').innerHTML += `<p class="warn">snapshot: ${error}</p>`
+            }
+          }
+          status('完了')
+        } catch (error) {
+          status(`失敗: ${error}`)
+        } finally {
+          button.disabled = false
+        }
+      }
+
+      $('run').addEventListener('click', run)
+    </script>
+  </body>
+</html>

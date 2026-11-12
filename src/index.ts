@@ -7,6 +7,8 @@
 
 export { GpuBackdrop } from './GpuBackdrop'
 export type { GpuBackdropProps } from './GpuBackdrop'
+export { selectTransferMode } from './transfer'
+export type { TransferContext, TransferSelector } from './transfer'
 export { useGpuWorker } from './useGpuWorker'
 export type {
   GpuWorkerReadyInfo,
@@ -14,4 +16,13 @@ export type {
   UseGpuWorkerResult,
   WorkerConstructor,
 } from './useGpuWorker'
-export type { FrameRequest, Mat4, ViewMatrices, WorkerResponse } from './protocol'
+export type {
+  BitmapFrameResponse,
+  BufferFrameResponse,
+  FrameRequest,
+  FrameResponse,
+  Mat4,
+  TransferMode,
+  ViewMatrices,
+  WorkerResponse,
+} from './protocol'

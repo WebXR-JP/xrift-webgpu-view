@@ -27,7 +27,13 @@ import {
   Vector3,
 } from 'three'
 import { useGpuWorker } from './useGpuWorker'
-import type { GpuWorkerReadyInfo, GpuWorkerStats, WorkerConstructor } from './useGpuWorker'
+import type {
+  GpuWorkerReadyInfo,
+  GpuWorkerStats,
+  TransferMode,
+  TransferSelector,
+  WorkerConstructor,
+} from './useGpuWorker'
 
 /** シーンより先に描くための renderOrder（背景） */
 const BACKDROP_RENDER_ORDER = -1000
@@ -113,8 +119,8 @@ export interface GpuBackdropProps {
   debug?: boolean
   /**
    * 区間別の計測を有効にするか（既定 false）。
-   * true のときだけ Worker・転送・メイン描画の時間を測り、
-   * 約 1000ms ごとに `onStats` を呼ぶ。false のときは何も変えない。
+   * true のときだけ Worker とメイン描画の時間を測り、
+   * 約 1000ms ごとに `onStats` を呼ぶ。描画経路は変えない。
    * マウント時に評価する。切り替えるには再マウントすること。
    * @internal デモ / 開発時の計測用。公開 API ではない。
    */
@@ -124,6 +130,13 @@ export interface GpuBackdropProps {
    * @internal デモ / 開発時の計測用。公開 API ではない。
    */
   onStats?: (stats: GpuWorkerStats) => void
+  /**
+   * 背景画像の受け渡し経路。
+   * 未指定なら `selectTransferMode` の既定判定（dGPU / Blink は 'bitmap'、それ以外は 'buffer'）。
+   * 固定値か、環境を見て選ぶ関数（マウント時に 1 回だけ評価）を渡して上書きできる。
+   * 詳しくは `useGpuWorker` の `transfer` を参照。
+   */
+  transfer?: TransferMode | TransferSelector
 }
 
 export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
@@ -140,6 +153,7 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
   debug = false,
   profile = false,
   onStats,
+  transfer,
 }) => {
   const gl = useThree((state) => state.gl)
   const size = useThree((state) => state.size)
@@ -226,6 +240,7 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
     debug,
     profile,
     onStats,
+    transfer,
   })
 
   // --- 背景の板ポリ ---------------------------------------------------------
