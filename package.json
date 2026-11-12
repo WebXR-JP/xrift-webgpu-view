@@ -64,10 +64,10 @@
   "devDependencies": {
     "@react-three/fiber": "^9.5.0",
     "@types/react": "^19.2.14",
-    "@types/three": "^0.183.1",
+    "@types/three": "^0.187.0",
     "@webgpu/types": "^0.1.66",
     "react": "~19.2.4",
-    "three": "^0.183.1",
+    "three": "^0.187.0",
     "typescript": "^5.6.2",
     "vite": "^7.3.1",
     "vite-plugin-dts": "^4.0.0"
