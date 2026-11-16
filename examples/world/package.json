@@ -59,6 +59,6 @@
   },
   "dependencies": {
     "@webxr-jp/webgpu-view": "file:../..",
-    "@xrift/world-components": "^0.63.0"
+    "@xrift/world-components": "^0.64.0"
   }
 }
