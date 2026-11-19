@@ -114,6 +114,8 @@ export const World = () => (
 | `enabled` | `true` | `false` で停止（背景が消える） |
 | `stereo` | `false` | モニタでも 2 視点（SBS）。XR 中は自動で 2 視点 |
 | `eyeSeparation` | `0.064` | SBS の眼間距離（m） |
+| `reproject` | `true` | XR 中、描画時の姿勢から現在の姿勢へ回転で再投影して首振りの遅延を補正。下記参照 |
+| `upscale` | `true` | XR 中、目の解像度への拡大に FSR1 の EASU を使う（`false` でバイリニア）。下記参照 |
 | `transfer` | 自動判定 | 描画結果の受け渡し経路（`'bitmap'` / `'buffer'` / 選択関数）。未指定なら `selectTransferMode`。下記参照 |
 | `onReady` / `onError` | — | `{ backend, adapter, width, height, transfer, meta }` / エラーメッセージ |
 | `debug` | `false` | コンソールに ready と fps を出す |
@@ -208,6 +210,17 @@ const { colorTexture, hasFrame, error } = useGpuWorker({
 
 `colorTexture` は `ImageBitmap` 由来で **上下が反転している**。貼るときは V を反転する。
 
+`getViewCameras` の戻り値は送信前に `updateMatrixWorld()` で最新化されるが、
+three の XR 目カメラ（`gl.xr.getCamera().cameras`）だけは呼ばずにそのまま使う
+（呼ぶと rig 込みの姿勢が壊れるため。上記「XR の挙動」参照）。通常のカメラは
+親からワールド行列を合成するので、自前で座標を更新している場合もそのままでよい。
+
+`onFrameResult?: () => void` は Worker の結果が届いた直後（テクスチャ反映より前）に
+呼ばれる。結果待ちの間は新しいフレームを送らないため、この時点で最後に
+`getViewCameras` が返した視点が、いま届いた結果を描いた視点と一致する。
+再投影のように「視点と画像の対応付け」が欲しい場合に使う
+（`GpuBackdrop` がこの仕組みで再投影している）。
+
 ## XR の挙動
 
 XR 中はブラウザが用意した目のカメラをそのまま使い、**左右の目ぶんを 1 フレームで
@@ -221,8 +234,46 @@ XR 中はブラウザが用意した目のカメラをそのまま使い、**左
 - Worker には **目ごとの射影行列** を送る。画像はその目のビューポートいっぱいに貼るので、
   メインシーンと画角が一致する。
 - 目のアスペクトが分かった時点で Worker の解像度を合わせ直す。
+- **目のカメラには `updateMatrixWorld()` を呼ばない。** three の WebXRManager は
+  目を rig（XROrigin）の子にせず、`updateCamera` の中で rig のワールド行列を掛けた
+  姿勢を `matrixWorld` / `matrixWorldInverse` に設定済み。呼ぶと rig 抜きの姿勢で
+  上書きしてしまい、プレイヤー（`kinematicPosition` の RigidBody など）が原点から
+  動いたぶんだけ背景の視点がずれる。`useGpuWorker` はこれを検出して避ける
+  （`isWebXrEyeCamera`）。`getViewCameras` を自前で書く場合も、戻り値の視点が
+  `updateMatrixWorld()` で壊れないことを意識する必要はない（ライブラリ側で面倒を見る）。
 
 3D の遮蔽はしない。WebGPU のシーンは常にメインシーンより奥になる。
+
+### XR の遅延補正（再投影と EASU）
+
+Worker の描画は 1 フレーム以上遅れて届く（Worker 描画 + ImageBitmap の受け渡し）。
+XR で首を振ると、その間の背景は古い姿勢で描かれたままなのでブレて見える。
+`GpuBackdrop` は既定で次の 2 つでこれを補正する（どちらも XR のときだけ働く）。
+
+- **再投影**（`reproject`、既定 true）: いま表示している画像を「描いた姿勢」から
+  「いまの姿勢」への回転差で UV をずらす。背景は事実上無限遠なので回転だけで
+  十分で、並進は無視する。描画時の姿勢は送信の直前に記録し、Worker の結果が
+  届いた時点で確定、テクスチャが更新された時点で昇格する。この 2 段階により
+  「表示中の画像」と「それを描いた視点」が 1 フレームもずれない。
+- **EASU**（`upscale`、既定 true）: 1 視点ぶんの解像度（`maxWidth`、既定 1280px）
+  を目の解像度（2.5〜3.4 倍）まで拡大するとき、バイリニアだと輪郭がぼやけるので、
+  FSR1 の EASU（12 タップのエッジ適応アップサンプル + 最近傍 4 テクセルへの
+  リンギング抑止）をかける。three の `FSR1Node` は r184+ の TSL /
+  WebGPURenderer 専用のため、EASU 部分だけを GLSL に移植したもの。
+  RCAS（2 パス目のシャープ）は入っていない。
+
+```tsx
+// 既定のまま（両方 ON）
+<GpuBackdrop worker={MyWorker} />
+
+// 切り分け用に OFF にする
+<GpuBackdrop worker={MyWorker} reproject={false} upscale={false} />
+```
+
+XR では 2 視点ぶんを 1 枚のアトラスに描くため、モニタと同じ解像度だと重い。
+`maxWidth` は 1 視点ぶんの上限なので、XR 向けには 640 程度（必要なら 320）から
+試すこと（PICO 4 Ultra での実測: 1280/eye で数 fps、640/eye で 20fps 前後、
+シーンの重さによる）。
 
 ### XRift の Enter VR
 
@@ -275,6 +326,19 @@ import { DepthComposite } from '@webxr-jp/webgpu-view/experimental'
   別インスタンスになるので、シーンやジオメトリは共有できない。
 - **Worker の配信 URL は絶対パス**（`/xxx-worker-<hash>.js`）。CDN がサブパス配信の場合は
   `vite.config.ts` の `base` を合わせる。合わないと背景が出ないだけ（メイン世界は動く）。
+- **ワールドをページと別オリジンで配信する場合は Worker を inline 化する。**
+  XRift はワールドを `assets.xrift.net`、ページを `app.xrift.net` で配信するため、
+  別ファイルの Worker は「別オリジン」として `SecurityError` になる（URL をサブパスに
+  合わせても同じ）。`?worker&inline` + `worker.rollupOptions.output.inlineDynamicImports`
+  で 1 ファイルにまとめ、blob から起動すると回避できる。この場合
+  `xrift.json` の `permissions.allowedCodeRules` に `no-javascript-blob` と
+  `no-network-without-permission` の宣言が必要（入室時に同意画面が出る）。
+- **blob Worker は init メッセージより先にモジュール評価が走る。** Worker 側で
+  モジュール読み込み時に読む設定（品質レベルなど）は `workerData` では間に合わない。
+  Worker コンストラクタの `name` オプションで渡して Worker 側で `self.name` を
+  読む（モジュール評価より前から利用可能）。
+  `new WorkerClass({ name: String(value) } as WorkerOptions)` のように、
+  `?worker` import のコンストラクタを薄くラップして渡す。
 - WebGPU 非対応の環境では Worker が `error` を返し、背景は非表示のまま。
   メインシーンは通常どおり動く（fail-safe）。
 - 背景はカメラに追従する（視差なし）。ワールドに固定したい場合は `useGpuWorker` を

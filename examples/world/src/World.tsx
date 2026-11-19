@@ -55,6 +55,9 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
     transferQuery === 'buffer' || transferQuery === 'bitmap' ? transferQuery : undefined
   const maxWidth = useMemo(() => queryNumber(query.get('maxWidth'), 1280), [query])
   const maxFps = useMemo(() => queryNumber(query.get('maxFps'), 60), [query])
+  // XR の遅延補正の切り分け用（既定は両方 ON。?reproject=0 / ?fsr=0 で OFF）
+  const reproject = query.get('reproject') !== '0'
+  const upscale = query.get('fsr') !== '0'
   const particles = useMemo(() => queryParticles(query.get('particles')), [query])
   const workerData = useMemo(
     () => ({ toneMapping: true, ...(particles !== undefined ? { particles } : {}) }),
@@ -160,6 +163,8 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
           maxWidth={maxWidth}
           maxFps={maxFps}
           stereo={STEREO}
+          reproject={reproject}
+          upscale={upscale}
           debug={debugQuery}
           profile={profile}
           onStats={handleStats}

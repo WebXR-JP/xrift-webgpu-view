@@ -74,7 +74,11 @@ export interface ResizeRequest {
 
 /** 1 視点分のカメラ。2 つ渡すと左右ステレオになる */
 export interface ViewMatrices {
-  /** ワールド → ビュー（カメラの matrixWorldInverse） */
+  /**
+   * ワールド → ビュー（カメラの matrixWorldInverse）。
+   * yaw/pitch に分解せず、右・上・前の基底としてそのまま使うこと。
+   * 分解するとロールが落ちて、XR で頭を傾けたときに世界が一緒に傾いて見える。
+   */
   view: Mat4
   /** カメラの projectionMatrix */
   projection: Mat4

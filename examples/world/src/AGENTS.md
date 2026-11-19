@@ -24,6 +24,13 @@
 Worker が同じ視点で描画 → `transferToImageBitmap()` → `postMessage(bitmap, [bitmap])` →
 メインで `Texture.image` に差し替える。
 
+XR 中は視点に three の目カメラ（`gl.xr.getCamera().cameras`）を使う。目カメラは
+rig の子ではなく `WebXRManager.updateCamera` が rig 込みの姿勢を設定済みなので、
+`useGpuWorker` はこれに `updateMatrixWorld()` を呼ばない（呼ぶと rig 抜きに戻り、
+プレイヤーが動いたぶんだけ背景の視点がずれる）。`GpuBackdrop` の再投影は、
+送信時の視点を `getViewCameras` で記録 → 結果届いた時点（`onFrameResult`）で確定 →
+テクスチャ更新時に「表示中の姿勢」へ昇格、として画像と姿勢を対応付けている。
+
 ## 必ず守ること
 
 ### 1. Worker の生成は Vite の `?worker` import 経由にする

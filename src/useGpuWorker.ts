@@ -13,6 +13,7 @@ import { useFrame, useThree } from '@react-three/fiber'
 import type { RootState } from '@react-three/fiber'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  ArrayCamera,
   DataTexture,
   LinearFilter,
   NearestFilter,
@@ -170,6 +171,17 @@ export interface UseGpuWorkerOptions {
    * @internal デモ / 開発時の計測用。公開 API ではない。
    */
   onStats?: (stats: GpuWorkerStats) => void
+  /**
+   * Worker の描画結果が届いた直後（結果待ちの解除後、テクスチャ反映より前）に
+   * 呼ばれる。`getViewCameras` が返した視点と結果の画像を対応付けるのに使う
+   * （`GpuBackdrop` の再投影では、このタイミングで「描画時の視点」を確定させる）。
+   *
+   * 結果を待っている間は新しいフレームを送らないため、この時点で最後に
+   * `getViewCameras` が返した視点が、いま届いた結果を描いた視点と一致する。
+   * ただし結果待ちがタイムアウトで送り直した直後は、古い結果が遅れて届くことが
+   * あり、その 1 フレームだけ対応がずれる（次の結果で自然に揃う）。
+   */
+  onFrameResult?: () => void
   /**
    * 深度画像も受け取る（毎フレーム 2 パス描画になる）。
    * @internal experimental/DepthComposite 専用。
@@ -350,6 +362,24 @@ function updateTexture(texture: Texture, bitmap: ImageBitmap) {
   texture.needsUpdate = true
 }
 
+/**
+ * three の WebXRManager が用意した「目のカメラ」か。
+ *
+ * XR の目カメラは親（rig / XROrigin）を持たず、`WebXRManager.updateCamera` が
+ * 「rig のワールド行列 × 目の行列」を `matrixWorld` / `matrixWorldInverse` に
+ * 設定済み。これに `updateMatrixWorld()` を呼ぶと、`Camera` のオーバーライドが
+ * `matrix`（rig 相対）から作り直すため **rig 抜きの姿勢で上書き**してしまい、
+ * Worker に送る視点がプレイヤーからずれる。このカメラは呼ばずにそのまま使う。
+ */
+export function isWebXrEyeCamera(
+  gl: WebGLRenderer,
+  camera: PerspectiveCamera,
+): boolean {
+  if (!gl.xr.isPresenting) return false
+  const cameras = (gl.xr.getCamera() as ArrayCamera).cameras
+  return cameras.length > 0 && cameras.includes(camera)
+}
+
 export function useGpuWorker({
   worker: WorkerClass,
   workerData,
@@ -363,6 +393,7 @@ export function useGpuWorker({
   debug = false,
   profile = false,
   onStats,
+  onFrameResult,
   internalDepth = false,
   transfer,
 }: UseGpuWorkerOptions): UseGpuWorkerResult {
@@ -464,6 +495,9 @@ export function useGpuWorker({
   const onStatsRef = useRef(onStats)
   onStatsRef.current = onStats
 
+  const onFrameResultRef = useRef(onFrameResult)
+  onFrameResultRef.current = onFrameResult
+
   // --- Worker 起動 ---------------------------------------------------------
   useEffect(() => {
     // maxFps 変更や Worker 起動で位相の基準を戻す（古い予定時刻を引きずらない）
@@ -523,6 +557,9 @@ export function useGpuWorker({
 
       inFlightRef.current = false
       lastErrorMessageRef.current = null
+      // 結果を描いた視点を確定させる（テクスチャ反映より前）。結果待ちの間は
+      // 新しい送信が無いので、この時点の「最後に送った視点」＝この結果の視点。
+      onFrameResultRef.current?.()
       stats.current.frames++
       stats.current.renderMs += message.renderMs
 
@@ -754,7 +791,10 @@ export function useGpuWorker({
     const viewCameras = getViews ? getViews(state) : [(state.camera as PerspectiveCamera)]
 
     const views: ViewMatrices[] = viewCameras.map((camera) => {
-      camera.updateMatrixWorld()
+      // XR の目カメラは WebXRManager が rig 込みで `matrixWorldInverse` を
+      // 更新済み。updateMatrixWorld() は rig 抜きの姿勢で上書きしてしまう
+      // （isWebXrEyeCamera のコメント参照）ので、それ以外だけ呼ぶ。
+      if (!isWebXrEyeCamera(state.gl, camera)) camera.updateMatrixWorld()
       return {
         view: Array.from(camera.matrixWorldInverse.elements),
         projection: Array.from(camera.projectionMatrix.elements),
