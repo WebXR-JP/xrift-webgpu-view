@@ -341,7 +341,8 @@ import { DepthComposite } from '@webxr-jp/webgpu-view/experimental'
   `?worker` import のコンストラクタを薄くラップして渡す。
 - WebGPU 非対応の環境では Worker が `error` を返し、背景は非表示のまま。
   メインシーンは通常どおり動く（fail-safe）。
-- 背景はカメラに追従する（視差なし）。ワールドに固定したい場合は `useGpuWorker` を
+- 背景の板ポリはスクリーン空間に置かれワールドに固定されない
+  （XR では各目の視点で描くので両眼視差は出る）。ワールドに固定したい場合は `useGpuWorker` を
   使って自前の板ポリに `colorTexture` を貼る。
 
 ## リポジトリ構成
