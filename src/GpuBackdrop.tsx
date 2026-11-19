@@ -289,12 +289,14 @@ void main() {
       float c = abs(c0) < 1e-5 ? 1e-5 : c0;
 
       vec2 ndc0 = vec2(pp.x * a0 / c - pp.z, pp.y * b0 / c - pp.w);
-      uv0 = clamp(ndc0 * 0.5 + 0.5, 0.0, 1.0); // 目のタイル外は端で止める
+      // NDC（上が +y）から sampleEye と同じ「下向きが +v」の座標へ戻す。
+      // 反転前の uv0（= uv）も同じ座標系なので、以降の経路は共通でよい
+      uv0 = clamp(vec2(ndc0.x * 0.5 + 0.5, 0.5 - ndc0.y * 0.5), 0.0, 1.0);
     }
 
-    // sampleEye は下向きが +v なので、ここで反転して渡す
-    vec2 luv = vec2(uv0.x, 1.0 - uv0.y);
-    vec3 color = uEasu > 0.5 ? easu(luv, eye, uEyeTexel) : sampleEye(luv, eye);
+    // どちらの経路の uv0 も「下向きが +v」（テクスチャの行順と同じ）なので
+    // そのまま sampleEye / easu へ渡す
+    vec3 color = uEasu > 0.5 ? easu(uv0, eye, uEyeTexel) : sampleEye(uv0, eye);
     gl_FragColor = vec4(linearToSRGB(color), 1.0);
     return;
   }
