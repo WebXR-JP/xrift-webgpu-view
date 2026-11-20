@@ -409,6 +409,11 @@ import { DepthComposite } from '@webxr-jp/webgpu-view/experimental'
 - **Worker の生成は `?worker` import 経由**にする。`new Worker(new URL(...))` は
   `@xrift/code-security` が「権限未宣言の通信」として弾く。
 - **`ImageBitmap` は `flipY` が効かない**。テクスチャは上下反転で入る。
+- **XR 中は Worker の `requestAnimationFrame` が止まることがある**（Android の Wolvic で確認）。
+  three の `WebGPURenderer` は `pass()` / `afterImage` / `bloom` など「フレームごとに 1 回」描くノードの
+  判定に `nodeFrame.frameId` を使い、これを進めるのは内部の rAF ループだけ。止まると XR に入った
+  瞬間の絵が残り、uniform で動くポストだけが動く。`defineGpuWorker` は `frame` メッセージごとに
+  `frameId` を進めて防いでいる。`render` フックの中で自前のループを回す場合も、この前提を崩さないこと。
 - **ウィンドウのリサイズで画像サイズが変わると、テクスチャを作り直す**。
   three は同じ `Source` のまま画像だけ差し替えると最初に確保した領域を使い回すため、
   画像が大きくなると転送がはみ出して `GL_INVALID_VALUE` になり、**背景が固まる**

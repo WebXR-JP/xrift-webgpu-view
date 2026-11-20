@@ -86,11 +86,17 @@ WebGPU 非対応環境では Worker が `error` を返し、スクリーンは `
 XRift の CDN がサブパス配信の場合 404 になり、スクリーンが出ないだけ（エラーにはならない）。
 実機で出すなら `vite.config.ts` の `base` を配信パスに合わせる。
 
-### 7. Worker には requestAnimationFrame が無い
+### 7. 描画トリガーは Worker の requestAnimationFrame ではない
 
-OffscreenCanvas を transfer していないため、Worker 側からは描画ループを回せない。
+OffscreenCanvas を transfer していないため、Worker 側の rAF で描画ループを回さない。
 メインスレッドからの `frame` メッセージを描画トリガーにしており、**結果が返るまで次を送らない**
 （1 フレーム 1 リクエスト）。この方式を崩すと遅延が溜まる。
+
+Chromium の Worker には rAF があり、three の `WebGPURenderer` の内部ループ（`nodeFrame.frameId`
+を進める）はそれで回る。ただし Android（PICO の Wolvic など）の XR 中は、ページの vsync と一緒に
+Worker の rAF も止まる。`frameId` が止まると `pass()` / `afterImage` / `bloom` などの
+FRAME 単位のノードが描き直されず、XR に入った瞬間の絵が残る（uniform だけで動くポストは動く）。
+`defineGpuWorker` は `frame` メッセージごとに `frameId` を進めて（`advanceNodeFrame`）これを防いでいる。
 
 ### 8. バンドルサイズ
 

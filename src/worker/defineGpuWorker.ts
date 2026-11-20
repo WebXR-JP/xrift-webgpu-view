@@ -6,8 +6,10 @@
  * ImageBitmap の転送、メッセージ処理をまとめて面倒を見る。
  *
  * 重要:
- * - Worker には requestAnimationFrame が無い（canvas を transfer していない）ため、
- *   メインスレッドからの 'frame' メッセージが描画トリガーになる。
+ * - 描画トリガーはメインスレッドからの 'frame' メッセージ（canvas を transfer していない）。
+ *   Chromium の Worker には requestAnimationFrame があり three の内部ループもそれで回るが、
+ *   Android（PICO の Wolvic など）の XR 中はページの vsync と一緒に止まる。
+ *   そのため 'frame' ごとに three のノードフレームを自前で進める（`advanceNodeFrame`）。
  * - 前のフレームが終わる前に次の要求が来たら「最新だけ」残して捨てる（遅延を溜めない）。
  * - 結果は postMessage で transfer する。ImageBitmap は受け取った側が close() する。
  */
@@ -352,8 +354,34 @@ async function renderToBuffer(
   return { packed, renderMs, readMs }
 }
 
+/** 直前の 'frame' で使った three のノードフレーム番号 */
+let lastNodeFrameId = -1
+
+/**
+ * 前回の 'frame' から three の `nodeFrame.frameId` が進んでいなければ 1 つ進める。
+ *
+ * `PassNode` / `AfterImageNode` / `BloomNode` などは「フレームごとに 1 回」
+ * （`NodeUpdateType.FRAME`）だけ描き直し、その判定に `frameId` を使う。
+ * `frameId` を進めるのはレンダラ内部の requestAnimationFrame ループだけで、
+ * `render()` は進めない。Worker の rAF が止まる環境（Android の XR 中）では
+ * `frameId` が固定され、シーンのパスが XR に入った瞬間の絵のまま残る
+ * （uniform だけで動くポストは動き続ける）。rAF が回っていれば毎回進んでいるので何もしない。
+ * three の公開 API に無いので内部（`_nodes.nodeFrame`）を参照する。
+ */
+function advanceNodeFrame() {
+  const nodeFrame = (
+    renderer as unknown as { _nodes?: { nodeFrame?: { frameId: number; update(): void } } } | null
+  )?._nodes?.nodeFrame
+  if (!nodeFrame) return
+  if (nodeFrame.frameId === lastNodeFrameId) nodeFrame.update()
+  lastNodeFrameId = nodeFrame.frameId
+}
+
 async function renderFrame(frame: FrameRequest) {
   if (!renderer || !canvas || !userScene) return
+
+  // rAF が止まっていても、'frame' ごとに FRAME 単位のノードを描き直させる
+  advanceNodeFrame()
 
   // 計測なしの通常経路。profile=false のときはここだけを使い、
   // 余計な performance.now() 呼び出しも増やさない。
@@ -697,6 +725,7 @@ scope.onmessage = async (event) => {
     renderTarget = null
     renderer?.dispose()
     renderer = null
+    lastNodeFrameId = -1
     initialized = false
     appliedSize = { width: 0, height: 0 }
     viewSize = { width: 0, height: 0 }
