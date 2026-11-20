@@ -72,6 +72,16 @@ export interface ResizeRequest {
   height: number
 }
 
+/**
+ * このフレームの描画モード。
+ *
+ * - `'monitor'`: モニタの単眼（1 視点）
+ * - `'monitor-stereo'`: モニタの SBS 確認用（2 視点）
+ * - `'xr-mono'`: XR 1 視点モード（`xrMono`。頭の中心 1 視点、両目に同じ画像）
+ * - `'xr-stereo'`: XR の通常（2 視点）
+ */
+export type GpuWorkerRenderMode = 'monitor' | 'monitor-stereo' | 'xr-mono' | 'xr-stereo'
+
 /** 1 視点分のカメラ。2 つ渡すと左右ステレオになる */
 export interface ViewMatrices {
   /**
@@ -102,6 +112,12 @@ export interface FrameRequest {
    * 1 要素 = 単眼、2 要素 = ステレオ（[0] が左目、[1] が右目）
    */
   views: ViewMatrices[]
+  /**
+   * このフレームの描画モード。`views.length` と一致する
+   * （`monitor` / `xr-mono` = 1 視点、`monitor-stereo` / `xr-stereo` = 2 視点）。
+   * 旧い送信側（未設定）のときは Worker 側で視点数から推測する。
+   */
+  mode?: GpuWorkerRenderMode
 }
 
 export interface DisposeRequest {

@@ -49,12 +49,25 @@ npm run check           # 本体 + ワールドの型チェックとビルド
 
 1. **`src/` にデモ固有のコードを入れない。** デモは `examples/world` 側に置く。
 2. **公開 API を変えたらルートの `README.md` と `examples/world` の利用箇所も直す。**
+   型シグネチャ（`GpuWorkerScene` / `GpuWorkerUpdateContext` / `GpuBackdropProps`）の
+   追加分は README の API 節にも反映し、`examples/world` は後方互換の確認用として
+   既定の挙動を変えずにビルドが通ること。
 3. **`react` / `three` / `@react-three/fiber` は external。** バンドルに含めない
    （`vite.config.ts` の `rollupOptions.external`）。
 4. **library は Worker を生成しない。** 生成は利用者側の `?worker` import に任せる
    （`new Worker(new URL(...))` は `@xrift/code-security` が REJECT するため）。
 5. **`dist` は参照される成果物。** ソースだけ変えても `examples/world` には反映されない。
-6. **ワールド固有の実装メモ** は `examples/world/AGENTS.md` と
+   `examples/world` で確認するときは直下のライブラリを先にビルドする
+   （`example:dev` / `predev` が面倒を見る）。
+6. **Worker の描画経路（`bitmap` / `buffer`）を変えたら両方で確認する。**
+   カスタム描画フックは両経路で同じフックを使う（buffer では `setRenderTarget` 済みが前提）。
+   深度パス（`DepthComposite`、`depth: true`）は `scene` の直接描画のままにし、
+   カスタム描画の対象はカラーパスのみにする。
+7. **XR の写像（シェーダ）を変えたら式と場所を残す。** 板ポリのフラグメント
+   （`GpuBackdrop.tsx` の `reprojectUv` / `uMono` 分岐など）と対応する CPU 側
+   （視点の解決・uniform の更新）を同時に直し、実機未検証の経路はその旨を明記する。
+   `xrMono` の再写像は必須なので `reproject` の ON/OFF より優先される。
+8. **ワールド固有の実装メモ** は `examples/world/AGENTS.md` と
    `examples/world/src/AGENTS.md` にある（描画順 / XR / 深度合成のハマりどころ）。
 
 ## 検証

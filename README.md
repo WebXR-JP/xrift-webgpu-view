@@ -113,6 +113,7 @@ export const World = () => (
 | `maxFps` | `60` | Worker を描画する最大頻度 |
 | `enabled` | `true` | `false` で停止（背景が消える） |
 | `stereo` | `false` | モニタでも 2 視点（SBS）。XR 中は自動で 2 視点 |
+| `xrMono` | `false` | XR 中に 1 視点だけ描き、両目に同じ画像を出す。下記「XR 1 視点モード」参照 |
 | `eyeSeparation` | `0.064` | SBS の眼間距離（m） |
 | `reproject` | `true` | XR 中、描画時の姿勢から現在の姿勢へ回転で再投影して首振りの遅延を補正。下記参照 |
 | `upscale` | `true` | XR 中、目の解像度への拡大に FSR1 の EASU を使う（`false` でバイリニア）。下記参照 |
@@ -182,7 +183,15 @@ interface GpuWorkerInit {
 
 interface GpuWorkerScene {
   scene: Scene
-  update?: (ctx: { time, delta, viewCount, renderer }) => void | Promise<void>
+  update?: (ctx: { time, delta, viewCount, renderer, mode, width, height }) => void | Promise<void>
+  /**
+   * カスタム描画。指定すると `renderer.render(scene, camera)` の代わりに呼ばれる。
+   * 自前のポストプロセス付きパイプラインで描くときに使う（下記参照）。
+   * `transfer: 'buffer'` のときも同じフックが使われ、フック内は
+   * 現在の描画先（`renderer.setRenderTarget` 済み）に描く前提。
+   * 未指定時は従来どおり（後方互換）。
+   */
+  render?: (ctx: GpuWorkerRenderContext) => void | Promise<void>
   warmup?: (camera: PerspectiveCamera) => void  // 最初のフレームまでの見た目
   meta?: Record<string, unknown>
   dispose?: () => void
@@ -194,7 +203,50 @@ interface GpuWorkerScene {
 - カメラはライブラリが作る。`init` では渡ってこないので、必要なら `update` の
   `renderer` と自分の uniform で完結させる。
 - `update` は描画の直前に呼ばれる。パーティクルの compute などはここで。
+  `width` / `height` は 1 視点ぶんの実 px（ポストのアスペクトやカメラのアスペクト合わせに使う）。
+  `mode` はこのフレームの描画モード（`'monitor'` / `'monitor-stereo'` / `'xr-mono'` / `'xr-stereo'`）。
+  `views.length === 1` だけではモニタ単眼と XR 1 視点が区別できないので、
+  モードで切り替える処理（XR 1 視点のときだけ頭の回転を重ねる等）はこちらを使う。
 - `warmup` を省略すると `(0, 1.7, 8)` から原点方向を見た 1 フレームが描かれる。
+
+### カスタム描画フック（`render`）
+
+既定ではライブラリが `renderer.render(scene, camera)` を視点ぶん繰り返すだけなので、
+残像・bloom・コンポジットなどの自前ポストプロセスは載らない。
+自分でパイプラインを所有しているときは、`render` フックで描く。
+
+```ts
+// my.worker.ts
+import { Scene } from 'three/webgpu'
+import { defineGpuWorker } from '@webxr-jp/webgpu-view/worker'
+import type { GpuWorkerRenderContext } from '@webxr-jp/webgpu-view/worker'
+import { RenderPipeline } from './pipeline'
+
+defineGpuWorker(({ renderer, width, height }) => {
+  const scene = new Scene()
+  const pipeline = new RenderPipeline(renderer, scene, width, height)
+
+  return {
+    scene,
+    update: ({ time, delta, width, height }) => {
+      pipeline.setSize(width, height) // update の width/height は 1 視点ぶんの実 px
+      pipeline.update(time, delta)
+    },
+    render: ({ renderer, views, width, height }: GpuWorkerRenderContext) => {
+      // views[0] が単眼 / 左目、views[1] が右目（ステレオ時）。
+      // 各 view の行列（view / projection）は利用側のカメラへ反映して使う。
+      // 描画先は呼び出し側で用意済み（buffer 経路では setRenderTarget 済み）。
+      // 視点ごとに既定と同じ描き分けをしたいときは context.applyViewport(i) を使う。
+      pipeline.render(views)
+    },
+  }
+})
+```
+
+- `render` が呼ばれるとき、描画先全体（アトラス全体）のビューポートは
+  呼び出し側で当て済み（`viewportApplied: true`）。そのまま描き始められる。
+- 深度パス（`experimental/DepthComposite`、`depth: true`）は従来どおり
+  `scene` を直接描く（カスタム描画の対象はカラーパスのみ）。
 
 ### `useGpuWorker`
 
@@ -275,6 +327,47 @@ XR では 2 視点ぶんを 1 枚のアトラスに描くため、モニタと�
 試すこと（PICO 4 Ultra での実測: 1280/eye で数 fps、640/eye で 20fps 前後、
 シーンの重さによる）。
 
+### XR 1 視点モード（`xrMono`）
+
+```tsx
+// XR 中だけ 1 視点で描き、両目に同じ画像を出す
+<GpuBackdrop worker={MyWorker} xrMono />
+```
+
+16:9 のモノラル映像など、画面空間のポストプロセス（`screenUV` を使う色収差・
+グリッチなど）が左右タイルにまたがると壊れる映像向け。通常の 2 視点（ステレオ）では
+1 視点ぶんがアトラスの半分だけしか使えないが、1 視点モードでは全体が 1 枚の絵になる。
+
+- Worker に送る視点は「頭の中心の姿勢」（両目の中間）1 つ。
+  射影は両目の視錐台をまとめて覆う対称な射影（左右の目の projection から
+  left/right/top/bottom の合成を取り、対称化したもの）。
+- 各目の板ポリは、その 1 枚を「自分の目で見た絵」に写像し直して表示する。
+  単なる回転ずらしではなく、視野（射影）が違うぶんの再写像が要る。
+- `maxWidth` は 1 視点ぶんの上限のまま。1 視点モードではアトラスの横幅が
+  1 視点分になる。XR 提示中の解像度はブラウザのウィンドウサイズに引きずられず、
+  `maxWidth × resolutionScale` を基準にする（PICO のようにウィンドウが小さくてもぼやけない）。
+- `debug` のログに `xrMono` の状態を含める（`mode: xr-mono` と出る）。
+
+写像の式（全画面クアッドのフラグメント、XR の再投影と同じ式）:
+
+```
+# 画面のピクセル → その目の射影の逆行列でレイ方向へ
+a1 = (ndcX + ox_eye) / sx_eye      # (sx, sy, ox, oy) は目の射影行列から
+b1 = (ndcY + oy_eye) / sy_eye
+d  = a1 * right_eye + b1 * up_eye + forward_eye   # 視線のワールド方向
+
+# 1 視点モードの射影で UV に変換
+a0 = dot(d, right_mono)            # 描画時の 1 視点の基底へ
+b0 = dot(d, up_mono)
+c0 = dot(d, forward_mono)
+ndc0 = (sx_mono * a0 / c0 - ox_mono, sy_mono * b0 / c0 - oy_mono)
+uv   = (ndc0.x * 0.5 + 0.5, 0.5 - ndc0.y * 0.5)
+```
+
+再投影（`reproject`）との優先順位: 1 視点モードではこの再写像が必須なので、
+`reproject` の ON/OFF には関係なく常に行われる（往復の遅延ぶんの回転補正も
+この写像に含まれる）。通常の 2 視点モードでは従来どおり `reproject` の指定に従う。
+
 ### XRift の Enter VR
 
 XRift の「Enter VR」は、ホスト側の `WebGLRenderer` に WebXR セッションを張る。
@@ -329,10 +422,28 @@ import { DepthComposite } from '@webxr-jp/webgpu-view/experimental'
 - **ワールドをページと別オリジンで配信する場合は Worker を inline 化する。**
   XRift はワールドを `assets.xrift.net`、ページを `app.xrift.net` で配信するため、
   別ファイルの Worker は「別オリジン」として `SecurityError` になる（URL をサブパスに
-  合わせても同じ）。`?worker&inline` + `worker.rollupOptions.output.inlineDynamicImports`
-  で 1 ファイルにまとめ、blob から起動すると回避できる。この場合
-  `xrift.json` の `permissions.allowedCodeRules` に `no-javascript-blob` と
+  合わせても同じ）。`?worker&inline` で Worker チャンクをワールドに埋め込み、
+  blob から起動すると回避できる（`new Worker(new URL(...))` は書かない。
+  `?worker` import 経由であることは変わらない）。
+  この場合 `xrift.json` の `permissions.allowedCodeRules` に `no-javascript-blob` と
   `no-network-without-permission` の宣言が必要（入室時に同意画面が出る）。
+
+  ```ts
+  // Vite の ?worker import に &inline を付けるだけ
+  import DemoWorker from './worker/demo.worker.ts?worker&inline'
+  ```
+
+  ```ts
+  // vite.config.ts（Worker チャンクの分割を抑えて 1 ファイルにまとめる）
+  export default defineConfig({
+    worker: {
+      format: 'es',
+      rollupOptions: {
+        output: { inlineDynamicImports: true },
+      },
+    },
+  })
+  ```
 - **blob Worker は init メッセージより先にモジュール評価が走る。** Worker 側で
   モジュール読み込み時に読む設定（品質レベルなど）は `workerData` では間に合わない。
   Worker コンストラクタの `name` オプションで渡して Worker 側で `self.name` を

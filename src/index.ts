@@ -21,6 +21,7 @@ export type {
   BufferFrameResponse,
   FrameRequest,
   FrameResponse,
+  GpuWorkerRenderMode,
   Mat4,
   TransferMode,
   ViewMatrices,

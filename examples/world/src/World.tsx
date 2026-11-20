@@ -58,6 +58,8 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
   // XR の遅延補正の切り分け用（既定は両方 ON。?reproject=0 / ?fsr=0 で OFF）
   const reproject = query.get('reproject') !== '0'
   const upscale = query.get('fsr') !== '0'
+  // XR 1 視点モードの確認用（既定 OFF。?xrMono=1 で ON。挙動の既定は変えない）
+  const xrMono = query.get('xrMono') === '1'
   const particles = useMemo(() => queryParticles(query.get('particles')), [query])
   const workerData = useMemo(
     () => ({ toneMapping: true, ...(particles !== undefined ? { particles } : {}) }),
@@ -163,6 +165,7 @@ export const World: React.FC<WorldProps> = ({ position = [0, 0, 0], scale = 1 })
           maxWidth={maxWidth}
           maxFps={maxFps}
           stereo={STEREO}
+          xrMono={xrMono}
           reproject={reproject}
           upscale={upscale}
           debug={debugQuery}

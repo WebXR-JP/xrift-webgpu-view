@@ -38,12 +38,14 @@ import {
   Mesh,
   PerspectiveCamera,
   PlaneGeometry,
+  Quaternion,
   ShaderMaterial,
   Vector2,
   Vector3,
   Vector4,
 } from 'three'
 import { isWebXrEyeCamera, useGpuWorker } from './useGpuWorker'
+import { computeBackdropResolution } from './backdropResolution'
 import type {
   GpuWorkerReadyInfo,
   GpuWorkerStats,
@@ -51,6 +53,7 @@ import type {
   TransferSelector,
   WorkerConstructor,
 } from './useGpuWorker'
+import type { GpuWorkerRenderMode } from './protocol'
 
 /** シーンより先に描くための renderOrder（背景） */
 const BACKDROP_RENDER_ORDER = -1000
@@ -90,6 +93,8 @@ uniform sampler2D uColor;
 uniform float uEyeCount;
 // XR で目ごとに描いている（タイルを選ぶ）
 uniform float uPerEye;
+// XR 1 視点モード（アトラス全体が 1 枚の絵。uPrevView0/uPrevProj0 が描画時の 1 視点）
+uniform float uMono;
 // 再投影している（描画時の姿勢が確定済み）
 uniform float uReproject;
 // EASU で拡大する
@@ -248,8 +253,58 @@ vec3 easu(vec2 uv, float eye, vec2 texel) {
   return clamp(acc, mn4, mx4);
 }
 
+/**
+ * 現在のピクセルの視線を、描画時の視点（pv / pp）の UV に写し直す。
+ * 背景は事実上無限遠なので回転だけの再投影で十分で、並進は無視する。
+ * 戻り値は sampleEye と同じ「下向きが +v」の座標系。
+ */
+vec2 reprojectUv(mat4 pv, vec4 pp, vec4 cp) {
+  // 現在のピクセルの視線（view 空間、c = 1）
+  float sx1 = cp.x;
+  float sy1 = cp.y;
+  float ox1 = cp.z;
+  float oy1 = cp.w;
+  float ndcX = vUv.x * 2.0 - 1.0;
+  float ndcY = vUv.y * 2.0 - 1.0;
+  float a1 = (ndcX + ox1) / sx1;
+  float b1 = (ndcY + oy1) / sy1;
+
+  vec3 r1 = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+  vec3 u1 = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+  vec3 f1 = -vec3(viewMatrix[0][2], viewMatrix[1][2], viewMatrix[2][2]);
+  vec3 d = a1 * r1 + b1 * u1 + f1; // 視線のワールド方向
+
+  // 描画時の基底に射影し直す
+  vec3 r0 = vec3(pv[0][0], pv[1][0], pv[2][0]);
+  vec3 u0 = vec3(pv[0][1], pv[1][1], pv[2][1]);
+  vec3 f0 = -vec3(pv[0][2], pv[1][2], pv[2][2]);
+  float a0 = dot(d, r0);
+  float b0 = dot(d, u0);
+  float c0 = dot(d, f0);
+  float c = abs(c0) < 1e-5 ? 1e-5 : c0;
+
+  vec2 ndc0 = vec2(pp.x * a0 / c - pp.z, pp.y * b0 / c - pp.w);
+  // NDC（上が +y）から sampleEye と同じ「下向きが +v」の座標へ戻す
+  return clamp(vec2(ndc0.x * 0.5 + 0.5, 0.5 - ndc0.y * 0.5), 0.0, 1.0);
+}
+
 void main() {
   vec2 uv = vec2(vUv.x, 1.0 - vUv.y);
+
+  if (uMono > 0.5) {
+    // XR 1 視点モード: アトラス全体が 1 枚の絵（uEyeCount = 1）。
+    // 各目の射影で作った視線を、描画時の 1 視点（uPrevView0 / uPrevProj0）の
+    // UV に写し直す。reproject と同じ式なので、往復の遅延ぶんの回転補正も
+    // この写像に含まれる（reproject の ON/OFF には関係なく必須）。
+    vec3 right = normalize(vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]));
+    float side = dot(cameraPosition - uHeadPosition, right);
+    vec4 cp = side >= 0.0 ? uCurProj1 : uCurProj0;
+    vec2 uv0 = reprojectUv(uPrevView0, uPrevProj0, cp);
+
+    vec3 color = uEasu > 0.5 ? easu(uv0, 0.0, uEyeTexel) : sampleEye(uv0, 0.0);
+    gl_FragColor = vec4(linearToSRGB(color), 1.0);
+    return;
+  }
 
   if (uPerEye > 0.5) {
     // いま描いている目（ヘッド中心より左右どちらか）
@@ -264,35 +319,7 @@ void main() {
       vec4 cp;
       if (eye < 0.5) { pv = uPrevView0; pp = uPrevProj0; cp = uCurProj0; }
       else { pv = uPrevView1; pp = uPrevProj1; cp = uCurProj1; }
-
-      // 現在のピクセルの視線（view 空間、c = 1）
-      float sx1 = cp.x;
-      float sy1 = cp.y;
-      float ox1 = cp.z;
-      float oy1 = cp.w;
-      float ndcX = vUv.x * 2.0 - 1.0;
-      float ndcY = vUv.y * 2.0 - 1.0;
-      float a1 = (ndcX + ox1) / sx1;
-      float b1 = (ndcY + oy1) / sy1;
-
-      vec3 r1 = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
-      vec3 u1 = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
-      vec3 f1 = -vec3(viewMatrix[0][2], viewMatrix[1][2], viewMatrix[2][2]);
-      vec3 d = a1 * r1 + b1 * u1 + f1; // 視線のワールド方向
-
-      // 描画時の基底に射影し直す
-      vec3 r0 = vec3(pv[0][0], pv[1][0], pv[2][0]);
-      vec3 u0 = vec3(pv[0][1], pv[1][1], pv[2][1]);
-      vec3 f0 = -vec3(pv[0][2], pv[1][2], pv[2][2]);
-      float a0 = dot(d, r0);
-      float b0 = dot(d, u0);
-      float c0 = dot(d, f0);
-      float c = abs(c0) < 1e-5 ? 1e-5 : c0;
-
-      vec2 ndc0 = vec2(pp.x * a0 / c - pp.z, pp.y * b0 / c - pp.w);
-      // NDC（上が +y）から sampleEye と同じ「下向きが +v」の座標へ戻す。
-      // 反転前の uv0（= uv）も同じ座標系なので、以降の経路は共通でよい
-      uv0 = clamp(vec2(ndc0.x * 0.5 + 0.5, 0.5 - ndc0.y * 0.5), 0.0, 1.0);
+      uv0 = reprojectUv(pv, pp, cp);
     }
 
     // どちらの経路の uv0 も「下向きが +v」（テクスチャの行順と同じ）なので
@@ -314,6 +341,67 @@ function writeProj(out: Vector4, camera: Camera) {
   out.set(p[0] || 1, p[5] || 1, p[8] || 0, p[9] || 0)
 }
 
+/**
+ * 左右の目の projection から、両目を覆う対称な射影を作る（XR 1 視点モード用）。
+ *
+ * 背景は事実上無限遠なので、目の左右オフセット（並進）は無視できる。
+ * 方向空間（a = x/z, b = y/z）での両目の視錐台の和集合を取り、
+ * 左右・上下それぞれ対称化したものを 1 枚の対称射影にする。
+ * 各辺の正規化値は `aMin = (ox-1)/sx` のように projection 行列から戻せる。
+ */
+function buildMonoProjection(
+  eyeL: Camera,
+  eyeR: Camera,
+  out: Matrix4,
+): { fov: number; aspect: number; near: number; far: number } {
+  const extents = (camera: Camera) => {
+    const e = camera.projectionMatrix.elements
+    const sx = e[0] || 1
+    const sy = e[5] || 1
+    const ox = e[8] || 0
+    const oy = e[9] || 0
+    return {
+      aMin: (ox - 1) / sx,
+      aMax: (ox + 1) / sx,
+      bMin: (oy - 1) / sy,
+      bMax: (oy + 1) / sy,
+    }
+  }
+  const l = extents(eyeL)
+  const r = extents(eyeR)
+  const halfA = Math.max(Math.abs(Math.min(l.aMin, r.aMin)), Math.abs(Math.max(l.aMax, r.aMax)))
+  const halfB = Math.max(Math.abs(Math.min(l.bMin, r.bMin)), Math.abs(Math.max(l.bMax, r.bMax)))
+  const near = Math.min(eyeL.near, eyeR.near) > 0 ? Math.min(eyeL.near, eyeR.near) : 0.1
+  const far = Math.max(eyeL.far, eyeR.far)
+  // 潰れた射影（sx/sy が非有限など）が来ても 0 除算にならないようにする
+  const safeA = Number.isFinite(halfA) && halfA > 1e-6 ? halfA : 1
+  const safeB = Number.isFinite(halfB) && halfB > 1e-6 ? halfB : 1
+  out.set(
+    1 / safeA,
+    0,
+    0,
+    0,
+    0,
+    1 / safeB,
+    0,
+    0,
+    0,
+    0,
+    -(far + near) / (far - near),
+    -1,
+    0,
+    0,
+    (-2 * far * near) / (far - near),
+    0,
+  )
+  return {
+    fov: (2 * Math.atan(safeB) * 180) / Math.PI,
+    aspect: safeA / safeB,
+    near,
+    far,
+  }
+}
+
 export interface GpuBackdropProps {
   /** `import MyWorker from './my.worker.ts?worker'` の既定エクスポート */
   worker: WorkerConstructor
@@ -331,6 +419,18 @@ export interface GpuBackdropProps {
    * XR 中は自動で 2 視点になる。
    */
   stereo?: boolean
+  /**
+   * XR 中に 2 目のアトラスの代わりに 1 視点だけ描き、両目に同じ画像を出す
+   * （既定 false）。16:9 のモノラル映像など、画面空間ポストが左右タイルに
+   * またがると壊れる映像向け。XR でないときは無視される。
+   *
+   * Worker に送る視点は「頭の中心の姿勢」1 つで、射影は両目の視錐台を
+   * まとめて覆う対称な射影になる。各目の板ポリは、その 1 枚を
+   * 「自分の目で見た絵」に写像し直して表示する（再写像は必須なので、
+   * `reproject` の ON/OFF には関係なく常に行われる）。
+   * `maxWidth` は 1 視点ぶんの上限のまま（アトラスの横幅が 1 視点分になる）。
+   */
+  xrMono?: boolean
   /** SBS の眼間距離（m） */
   eyeSeparation?: number
   /**
@@ -379,6 +479,7 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
   maxFps = 60,
   enabled = true,
   stereo = false,
+  xrMono = false,
   eyeSeparation = 0.064,
   reproject = true,
   upscale = true,
@@ -396,7 +497,9 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
   /** XR 中の 1 視点ぶんのアスペクト（XR に入るまで null） */
   const [xrAspect, setXrAspect] = useState<number | null>(null)
 
-  const eyeCount = xrAspect !== null ? 2 : stereo ? 2 : 1
+  /** XR 提示中か（`xrAspect` が入っている間。抜けたら null に戻る。1 フレーム遅延する） */
+  const presentingByAspect = xrAspect !== null
+  const eyeCount = presentingByAspect ? (xrMono ? 1 : 2) : stereo ? 2 : 1
   const displayAspect =
     size.width > 0 && size.height > 0 ? size.width / size.height : 1
   // XR のアスペクトが壊れている（0 / NaN）ときはモニタのアスペクトで代用する
@@ -404,20 +507,33 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
     xrAspect !== null && Number.isFinite(xrAspect) && xrAspect > 0 ? xrAspect : displayAspect
 
   // --- Worker 側の解像度（1 視点ぶん） --------------------------------------
-  const resolution = useMemo(() => {
-    const width = Math.max(
-      64,
-      Math.min(maxWidth, Math.round((size.width * dpr * resolutionScale) / eyeCount)),
-    )
-    // アスペクトが 0 / NaN のときに高さが Infinity にならないようにする
-    return { width, height: Math.max(1, Math.round(width / imageAspect)) }
-  }, [size.width, dpr, resolutionScale, maxWidth, eyeCount, imageAspect])
+  // XR 中の基準は `maxWidth`（`size` はブラウザのウィンドウであって
+  // XR フレームバッファではない）。詳しくは computeBackdropResolution を参照。
+  const resolution = useMemo(
+    () =>
+      computeBackdropResolution({
+        presenting: presentingByAspect,
+        cssWidth: size.width,
+        dpr,
+        resolutionScale,
+        maxWidth,
+        eyeCount,
+        aspect: imageAspect,
+      }),
+    [presentingByAspect, size.width, dpr, resolutionScale, maxWidth, eyeCount, imageAspect],
+  )
 
   // --- 視点（カメラ）--------------------------------------------------------
   const eyeCameras = useMemo(() => [new PerspectiveCamera(), new PerspectiveCamera()], [])
+  /** XR 1 視点モード（xrMono）で Worker に送る「頭の中心の姿勢」のカメラ */
+  const monoCamera = useMemo(() => new PerspectiveCamera(), [])
+  const monoProj = useMemo(() => new Matrix4(), [])
   const headPosition = useMemo(() => new Vector3(), [])
   const rightVector = useMemo(() => new Vector3(), [])
   const tmpVector = useMemo(() => new Vector3(), [])
+  const tmpQuatA = useMemo(() => new Quaternion(), [])
+  const tmpQuatB = useMemo(() => new Quaternion(), [])
+  const tmpScale = useMemo(() => new Vector3(1, 1, 1), [])
 
   // --- 再投影用の姿勢 --------------------------------------------------------
   // 送信時の視点（保留）。結果が届いた時点で「確定」に移し、テクスチャが
@@ -431,6 +547,8 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
   const prevProj = useMemo(() => [new Vector4(1, 1, 0, 0), new Vector4(1, 1, 0, 0)], [])
   const hasPrev = useRef(false)
   const lastImage = useRef<unknown>(null)
+  /** Worker へ送るこのフレームの描画モード（視点数と一致させる） */
+  const modeRef = useRef<GpuWorkerRenderMode>('monitor')
 
   /** 送信する視点の姿勢を「保留」に記録する（useGpuWorker が送信直前に呼ぶ） */
   const recordPose = useCallback(
@@ -488,7 +606,32 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
           .add(tmpVector.setFromMatrixPosition(eyes[1].matrixWorld))
           .multiplyScalar(0.5)
 
+        if (xrMono) {
+          // 1 視点モード: 頭の中心の姿勢 1 つだけ送る。背景は事実上無限遠なので
+          // 姿勢は両目の中間（位置の中点・向きの slerp 中間）で十分。
+          // matrixWorld は WebXRManager が rig 込みで更新済みなので、
+          // ここでは updateMatrixWorld() を呼ばずに読み出すだけにする
+          //（呼ぶと rig 抜きの姿勢で上書きしてしまう）。
+          eyes[0].matrixWorld.decompose(monoCamera.position, tmpQuatA, tmpScale)
+          eyes[1].matrixWorld.decompose(tmpVector, tmpQuatB, tmpScale)
+          tmpQuatA.slerp(tmpQuatB, 0.5)
+          monoCamera.quaternion.copy(tmpQuatA)
+          monoCamera.scale.set(1, 1, 1)
+          monoCamera.updateMatrixWorld()
+          const info = buildMonoProjection(eyes[0], eyes[1], monoProj)
+          monoCamera.projectionMatrix.copy(monoProj)
+          monoCamera.projectionMatrixInverse.copy(monoProj).invert()
+          monoCamera.fov = info.fov
+          monoCamera.aspect = info.aspect
+          monoCamera.near = info.near
+          monoCamera.far = info.far
+          if (record) recordPose(monoCamera, 0)
+          modeRef.current = 'xr-mono'
+          return [monoCamera]
+        }
+
         if (record) eyes.forEach((eye, index) => recordPose(eye, index))
+        modeRef.current = 'xr-stereo'
         return eyes
       }
 
@@ -497,6 +640,7 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
       if (!stereo) {
         headPosition.setFromMatrixPosition(main.matrixWorld)
         if (record) recordPose(main, 0)
+        modeRef.current = 'monitor'
         return [main]
       }
 
@@ -514,15 +658,33 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
       })
 
       headPosition.copy(center)
+      modeRef.current = 'monitor-stereo'
       return eyeCameras
     },
-    [gl, stereo, eyeSeparation, eyeCameras, headPosition, rightVector, tmpVector, recordPose],
+    [
+      gl,
+      stereo,
+      xrMono,
+      eyeSeparation,
+      eyeCameras,
+      monoCamera,
+      monoProj,
+      headPosition,
+      rightVector,
+      tmpVector,
+      tmpQuatA,
+      tmpQuatB,
+      tmpScale,
+      recordPose,
+    ],
   )
 
   const getViewCameras = useCallback(
     (state: RootState): Camera[] => resolveCameras(state, true),
     [resolveCameras],
   )
+
+  const getFrameMode = useCallback(() => modeRef.current, [])
 
   const { colorTexture, hasFrame } = useGpuWorker({
     worker,
@@ -532,6 +694,7 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
     maxFps,
     enabled,
     getViewCameras,
+    getFrameMode,
     onFrameResult: handleFrameResult,
     onReady,
     onError,
@@ -552,6 +715,7 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
           uColor: { value: null },
           uEyeCount: { value: 1 },
           uPerEye: { value: 0 },
+          uMono: { value: 0 },
           uReproject: { value: 0 },
           uEasu: { value: 0 },
           uEyeTexel: { value: new Vector2(1 / 640, 1 / 640) },
@@ -586,6 +750,16 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
     gl.xr.enabled = true
   }, [gl])
 
+  // debug 時はモードの切り替わりが追えるように状態を出す（xrMono の状態を含む）
+  useEffect(() => {
+    if (!debug) return
+    const presenting = xrAspect !== null
+    console.info(
+      `[webgpu-view] mode: ${presenting ? (xrMono ? 'xr-mono' : 'xr-stereo') : stereo ? 'monitor-stereo' : 'monitor'} ` +
+        `/ xrMono=${xrMono} / eyeCount=${eyeCount} / ${resolution.width}x${resolution.height}`,
+    )
+  }, [debug, xrMono, stereo, xrAspect, eyeCount, resolution.width, resolution.height])
+
   useFrame((state) => {
     const mesh = backdropRef.current
     if (!mesh) return
@@ -600,11 +774,18 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
     // 視点を更新（headPosition もここで更新される）
     const cameras = resolveCameras(state, false)
     const presenting = gl.xr.isPresenting
+    // XR 1 視点モード: Worker には頭の中心 1 視点だけ送り、両目に同じ画像を出す
+    const monoMode = presenting && xrMono
     const eyeMode = presenting && cameras.length >= 2
 
-    // XR に入ったら、目のアスペクトで Worker の解像度を合わせ直す
-    if (eyeMode) {
-      const projection = cameras[0].projectionMatrix.elements
+    // XR に入ったら、アスペクトで Worker の解像度を合わせ直す。
+    // 1 視点モードでは対称射影（monoProj）のアスペクトを使う。
+    // cameras[0]（目のアスペクト）を使うと、テクスチャの縦横比が角度の比と
+    // 合わず水平方向の解像度が不足し、ポストに渡るアスペクトもずれる
+    // （PICO のように目がほぼ正方形だと 1.0 になり、広い視野の左右が暗くなる）。
+    // 2 視点のときは従来どおり目のアスペクト。
+    if (presenting) {
+      const projection = (monoMode ? monoProj : cameras[0].projectionMatrix).elements
       const aspect = projection[5] / projection[0]
       if (xrAspect === null || Math.abs(aspect - xrAspect) > 0.01) setXrAspect(aspect)
     } else if (xrAspect !== null) {
@@ -613,20 +794,35 @@ export const GpuBackdrop: React.FC<GpuBackdropProps> = ({
 
     const u = material.uniforms
     u.uColor.value = colorTexture
-    u.uEyeCount.value = cameras.length
+    u.uEyeCount.value = monoMode ? 1 : cameras.length
     u.uPerEye.value = eyeMode ? 1 : 0
+    // 1 視点モードの再写像は必須なので、reproject の ON/OFF には関係なく常に行う
+    u.uMono.value = monoMode ? 1 : 0
     // 再投影するのは「XR かつ 描画時の姿勢が確定済み」のときだけ
     u.uReproject.value = eyeMode && reproject && hasPrev.current ? 1 : 0
     // 拡大は常に XR のときだけ（モニタではほぼ 1:1 なので 12 タップの意味がない）
-    u.uEasu.value = eyeMode && upscale ? 1 : 0
+    u.uEasu.value = (eyeMode || monoMode) && upscale ? 1 : 0
     u.uEyeTexel.value.set(1 / Math.max(1, resolution.width), 1 / Math.max(1, resolution.height))
     ;(u.uHeadPosition.value as Vector3).copy(headPosition)
     ;(u.uPrevView0.value as Matrix4).copy(prevView[0])
     ;(u.uPrevView1.value as Matrix4).copy(prevView[1])
     ;(u.uPrevProj0.value as Vector4).copy(prevProj[0])
     ;(u.uPrevProj1.value as Vector4).copy(prevProj[1])
-    writeProj(u.uCurProj0.value as Vector4, cameras[0])
-    writeProj(u.uCurProj1.value as Vector4, cameras[Math.min(1, cameras.length - 1)])
+    if (monoMode) {
+      // 1 視点モードでは cameras[0] が 1 視点（頭の中心）なので、
+      // 各目の射影は XR カメラから直接取る
+      const xrEyes = (gl.xr.getCamera() as ArrayCamera).cameras as Camera[]
+      if (xrEyes.length >= 2) {
+        writeProj(u.uCurProj0.value as Vector4, xrEyes[0])
+        writeProj(u.uCurProj1.value as Vector4, xrEyes[1])
+      } else {
+        writeProj(u.uCurProj0.value as Vector4, cameras[0])
+        writeProj(u.uCurProj1.value as Vector4, cameras[0])
+      }
+    } else {
+      writeProj(u.uCurProj0.value as Vector4, cameras[0])
+      writeProj(u.uCurProj1.value as Vector4, cameras[Math.min(1, cameras.length - 1)])
+    }
   })
 
   return (

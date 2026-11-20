@@ -26,7 +26,7 @@ import {
 } from 'three'
 import type { WebGLRenderer } from 'three'
 import { normalizeDimension } from './protocol'
-import type { TransferMode, WorkerResponse } from './protocol'
+import type { GpuWorkerRenderMode, TransferMode, WorkerResponse } from './protocol'
 import type { FrameRequest, ViewMatrices } from './protocol'
 import { selectTransferMode } from './transfer'
 import type { TransferContext, TransferSelector } from './transfer'
@@ -137,6 +137,14 @@ export interface UseGpuWorkerOptions {
    * 省略時はメインカメラ 1 視点。
    */
   getViewCameras?: (state: RootState) => PerspectiveCamera[]
+  /**
+   * このフレームの描画モードを返す関数。`getViewCameras` と同じフレームで呼ばれ、
+   * 返した視点数と一致させること（`monitor` / `xr-mono` = 1 視点、
+   * `monitor-stereo` / `xr-stereo` = 2 視点）。
+   * 省略時は視点数から推測する（1 視点 = `'monitor'`、2 視点 = `'monitor-stereo'`）。
+   * `GpuBackdrop` は `xrMono` / `stereo` / XR 提示状態から決めて渡す。
+   */
+  getFrameMode?: () => GpuWorkerRenderMode
   onReady?: (info: GpuWorkerReadyInfo) => void
   onError?: (message: string) => void
   /** コンソールに ready / fps を出す（既定 false） */
@@ -388,6 +396,7 @@ export function useGpuWorker({
   maxFps = 60,
   enabled = true,
   getViewCameras,
+  getFrameMode,
   onReady,
   onError,
   debug = false,
@@ -480,6 +489,9 @@ export function useGpuWorker({
 
   const getViewCamerasRef = useRef(getViewCameras)
   getViewCamerasRef.current = getViewCameras
+
+  const getFrameModeRef = useRef(getFrameMode)
+  getFrameModeRef.current = getFrameMode
 
   const onReadyRef = useRef(onReady)
   onReadyRef.current = onReady
@@ -813,6 +825,8 @@ export function useGpuWorker({
       time,
       delta: Math.min(delta, 0.1),
       views,
+      // 送信側が視点数と一致させて送る。未指定のときだけ視点数から推測する
+      mode: getFrameModeRef.current?.() ?? (views.length > 1 ? 'monitor-stereo' : 'monitor'),
     }
 
     inFlightRef.current = true

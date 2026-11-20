@@ -26,12 +26,13 @@ import { clamp, positionView, sRGBTransferEOTF, vec3 } from 'three/tsl'
 import { MAX_DIMENSION, normalizeDimension } from '../protocol'
 import type {
   FrameRequest,
+  GpuWorkerRenderMode,
   TransferMode,
   ViewMatrices,
   WorkerRequest,
   WorkerResponse,
 } from '../protocol'
-import type { GpuWorkerScene, GpuWorkerSceneFactory } from './types'
+import type { GpuWorkerRenderContext, GpuWorkerScene, GpuWorkerSceneFactory } from './types'
 
 /** worker スコープ（tsconfig が DOM lib なので最小限を自前で宣言する） */
 const scope = globalThis as unknown as {
@@ -166,6 +167,48 @@ function applyViewport(index: number) {
   renderer.setScissorTest(true)
 }
 
+/**
+ * 描画先全体（アトラス全体）にビューポートを当て、シザーを切る。
+ * カスタム描画フックを呼ぶ前に呼び出し側で当てておく。
+ */
+function applyFullAtlas() {
+  if (!renderer) return
+  renderer.setViewport(0, 0, appliedSize.width, appliedSize.height)
+  renderer.setScissor(0, 0, appliedSize.width, appliedSize.height)
+  renderer.setScissorTest(false)
+}
+
+/**
+ * カスタム描画フック用のコンテキストを作る。
+ * 描画先の用意（canvas / `setRenderTarget` 済みの RenderTarget）と
+ * アトラス全体のビューポートは呼び出し側で済ませてから呼ぶ。
+ */
+function createRenderContext(
+  frameViews: ViewMatrices[],
+  mode: GpuWorkerRenderMode,
+): GpuWorkerRenderContext {
+  if (!renderer) {
+    throw new Error('カスタム描画の呼び出し時に renderer が初期化されていません')
+  }
+  return {
+    renderer,
+    views: frameViews,
+    mode,
+    width: viewSize.width,
+    height: viewSize.height,
+    viewportApplied: true,
+    applyViewport: (index: number) => applyViewport(index),
+  }
+}
+
+/**
+ * このフレームの描画モードを決める。送信側（`FrameRequest.mode`）が
+ * 視点数と一致させて送る。未設定の旧い送信側のときだけ視点数から推測する。
+ */
+function resolveMode(mode: GpuWorkerRenderMode | undefined, count: number): GpuWorkerRenderMode {
+  return mode ?? (count > 1 ? 'monitor-stereo' : 'monitor')
+}
+
 /** OffscreenCanvas の内容を ImageBitmap にする（WebGPU コンテキストでも動く方を使う） */
 async function snapshot(target: OffscreenCanvas) {
   try {
@@ -262,7 +305,11 @@ function setOutputTarget(target: RenderTarget | null) {
  * 一方で GPU→CPU のコピーが入るため、非 UMA（ディスクリート GPU）では
  * ImageBitmap 経路より遅くなりうる。経路は呼び出し側が選ぶ。
  */
-async function renderToBuffer(count: number) {
+async function renderToBuffer(
+  count: number,
+  frameViews: ViewMatrices[],
+  mode: GpuWorkerRenderMode,
+) {
   if (!renderer || !userScene || !renderTarget) {
     throw new Error('buffer 経路の RenderTarget が初期化されていません')
   }
@@ -273,9 +320,17 @@ async function renderToBuffer(count: number) {
   // RenderTarget 側のテクスチャはリニア形式にして、変換が二重にならないようにする。
   setOutputTarget(renderTarget)
   renderer.setRenderTarget(renderTarget)
-  for (let i = 0; i < count; i++) {
-    applyViewport(i)
-    renderer.render(userScene.scene, getCamera(i))
+  if (userScene.render) {
+    // カスタム描画フック: フック内が現在の描画先（setRenderTarget 済み）に描く。
+    // アトラス全体のビューポートは当て済み。視点ごとに既定と同じ描き分けを
+    // したいときは context.applyViewport(index) を使う。
+    applyFullAtlas()
+    await userScene.render(createRenderContext(frameViews, mode))
+  } else {
+    for (let i = 0; i < count; i++) {
+      applyViewport(i)
+      renderer.render(userScene.scene, getCamera(i))
+    }
   }
   renderer.setScissorTest(false)
   renderer.setRenderTarget(null)
@@ -313,10 +368,18 @@ async function renderFrame(frame: FrameRequest) {
       applyView(getCamera(i), frame.views[i])
     }
 
-    await userScene.update?.({ time: frame.time, delta: frame.delta, viewCount: count, renderer })
+    await userScene.update?.({
+      time: frame.time,
+      delta: frame.delta,
+      viewCount: count,
+      renderer,
+      mode: resolveMode(frame.mode, count),
+      width: viewSize.width,
+      height: viewSize.height,
+    })
 
     if (transferMode === 'buffer') {
-      const { packed } = await renderToBuffer(count)
+      const { packed } = await renderToBuffer(count, frame.views, resolveMode(frame.mode, count))
       scope.postMessage(
         {
           type: 'result',
@@ -332,7 +395,14 @@ async function renderFrame(frame: FrameRequest) {
     }
 
     const depthBitmap = wantDepth ? await renderDepthPass(count) : null
-    renderViews(count)
+    if (userScene.render) {
+      // カスタム描画フック: フック内が canvas に描く。
+      // アトラス全体のビューポートは当て済み。
+      applyFullAtlas()
+      await userScene.render(createRenderContext(frame.views, resolveMode(frame.mode, count)))
+    } else {
+      renderViews(count)
+    }
 
     const bitmap = await snapshot(canvas)
 
@@ -361,7 +431,15 @@ async function renderFrame(frame: FrameRequest) {
   }
 
   const updateStart = performance.now()
-  await userScene.update?.({ time: frame.time, delta: frame.delta, viewCount: count, renderer })
+  await userScene.update?.({
+    time: frame.time,
+    delta: frame.delta,
+    viewCount: count,
+    renderer,
+    mode: resolveMode(frame.mode, count),
+    width: viewSize.width,
+    height: viewSize.height,
+  })
   const updateMs = performance.now() - updateStart
 
   let renderMs: number
@@ -372,16 +450,21 @@ async function renderFrame(frame: FrameRequest) {
 
   if (transferMode === 'buffer') {
     // 読み戻し（GPU→CPU）を snapshot 区間として扱う
-    const result = await renderToBuffer(count)
+    const result = await renderToBuffer(count, frame.views, resolveMode(frame.mode, count))
     renderMs = result.renderMs
     snapshotMs = result.readMs
     packed = result.packed
   } else {
-    // renderMs は renderer.render() の JS 呼び出し時間（深度パスを含む）。
+    // renderMs は描画の JS 呼び出し時間（深度パスを含む）。
     // GPU の完了待ちは含まない。
     const renderStart = performance.now()
     depthBitmap = wantDepth ? await renderDepthPass(count) : null
-    renderViews(count)
+    if (userScene.render) {
+      applyFullAtlas()
+      await userScene.render(createRenderContext(frame.views, resolveMode(frame.mode, count)))
+    } else {
+      renderViews(count)
+    }
     renderMs = performance.now() - renderStart
 
     // snapshot は GPU 完了待ちを含みうる
